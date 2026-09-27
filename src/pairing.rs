@@ -14,15 +14,19 @@ pub struct PairingQr {
     pub password: String,
 }
 
-/// 生成一次配对会话：随机实例名 + 6 位数字密码
+/// 生成一次配对会话：6 位数字密码
 ///
-/// 载荷格式（Android Studio / AOSP）：WIFI:T:ADB;S:<service>;P:<password>;;
+/// 载荷格式（与 Android / escrcpy 兼容）：
+/// `WIFI:T:ADB;S:ADBQR-connectPhoneOverWifi;P:<password>;;`
+/// 注意 S 字段固定为 `ADBQR-connectPhoneOverWifi`：手机扫码后广播的是
+/// **手机自己的** `_adb-tls-pairing._tcp` mDNS 服务（实例名与 S 无关），
+/// PC 端扫描到任意 pairing 服务后用 P 字段的密码执行 `adb pair`。
 pub fn generate() -> PairingQr {
-    let service_instance = format!("gscrcpy-{:08x}", rand::random::<u32>());
+    let service_instance = "ADBQR-connectPhoneOverWifi".to_string();
     let password: String = (0..6)
         .map(|_| (rand::random::<u32>() % 10).to_string())
         .collect();
-    let payload = format!("WIFI:T:ADB;S:{};P:{};;", service_instance, password);
+    let payload = format!("WIFI:T:ADB;S:{service_instance};P:{password};;");
     PairingQr {
         payload,
         service_instance,
@@ -61,10 +65,12 @@ pub fn qr_pixels(payload: &str, scale: usize) -> Result<(usize, usize, Vec<u8>),
     Ok((size, size, px))
 }
 
-/// 后台配对流程：
-/// 1. 轮询 `adb mdns services` 等待 `_adb-tls-pairing._tcp` 出现（实例名匹配二维码 S）
-/// 2. 执行 `adb pair host:port 密码`
-/// 3. 等待 `_adb-tls-connect._tcp` 出现并 `adb connect`
+/// 后台配对流程（与 escrcpy 一致的机制）：
+/// 1. 轮询 `adb mdns services` 等 `_adb-tls-pairing._tcp` 服务出现
+///    （手机扫码后广播的是手机自己的实例名，因此**不匹配二维码 S 字段**）
+/// 2. 对发现的 pairing 服务逐个执行 `adb pair host:port 密码`（多台手机时可能连错，
+///    失败则尝试下一个）
+/// 3. 配对成功后等 `_adb-tls-connect._tcp` 出现并 `adb connect`
 pub fn pair_loop(
     adb_path: PathBuf,
     qr: &PairingQr,
@@ -82,14 +88,17 @@ pub fn pair_loop(
                     .into(),
             );
         }
-        for svc in adb.mdns_services() {
-            if svc.service == "_adb-tls-pairing._tcp"
-                && (svc.instance == qr.service_instance
-                    || svc.instance.contains(&qr.service_instance))
-            {
-                let host_port = format!("{}:{}", svc.host, svc.port);
-                adb.pair(&host_port, &qr.password)?;
-                return wait_and_connect(&adb, &svc.host, cancel);
+        let pairing: Vec<_> = adb
+            .mdns_services()
+            .into_iter()
+            .filter(|s| s.service == "_adb-tls-pairing._tcp")
+            .collect();
+        for svc in &pairing {
+            let host_port = format!("{}:{}", svc.host, svc.port);
+            match adb.pair(&host_port, &qr.password) {
+                Ok(_) => return wait_and_connect(&adb, &svc.host, cancel),
+                // 配对失败：可能连到了局域网中另一台开启无线调试的手机，尝试下一个
+                Err(_) => continue,
             }
         }
         std::thread::sleep(Duration::from_millis(800));
@@ -128,11 +137,12 @@ mod tests {
     #[test]
     fn payload_format() {
         let qr = generate();
-        assert!(qr.payload.starts_with("WIFI:T:ADB;S:gscrcpy-"));
+        assert!(qr.payload.starts_with("WIFI:T:ADB;S:ADBQR-connectPhoneOverWifi;P:"));
         assert!(qr.payload.ends_with(";;"));
         assert_eq!(qr.password.len(), 6);
         assert!(qr.password.chars().all(|c| c.is_ascii_digit()));
         assert!(qr.payload.contains(&format!("P:{}", qr.password)));
+        assert_eq!(qr.service_instance, "ADBQR-connectPhoneOverWifi");
     }
 
     #[test]
