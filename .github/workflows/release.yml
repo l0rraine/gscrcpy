@@ -40,7 +40,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --release
+        # 测试用 debug 模式（快，逻辑验证不需要 release 优化）；
+        # 真正的发布构建在下一步使用 --release
+        run: cargo test
 
       - name: Build release binary
         run: cargo build --release
