@@ -1,0 +1,13 @@
+# Rust 构建产物
+/target
+
+# 运行期生成的工具目录（scrcpy/adb 二进制由程序自行下载）
+/tools
+
+# 日志与临时文件
+*.log
+*.png
+
+# 编辑器
+.vscode/
+.idea/
