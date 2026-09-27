@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -9,12 +10,13 @@ use eframe::egui;
 use crate::adb::{Adb, DeviceInfo, MdnsService};
 use crate::config::Config;
 use crate::pairing::{self, PairingQr};
-use crate::scrcpy::Scrcpy;
+use crate::scrcpy::{AppInfo, Scrcpy};
 use crate::updater;
 
 pub enum Msg {
     Devices(Vec<DeviceInfo>),
-    Packages(String, Vec<String>), // (请求时的串号, 结果)
+    // (请求时的串号, 机主应用(含显示名), [(分身用户id, 用户名, 该用户的应用包名)])
+    Packages(String, Vec<AppInfo>, Vec<(i32, String, Vec<String>)>),
     ScrcpyVersion(Option<String>),
     PairDone(Result<String, String>),
     UpdateCheck(Result<updater::ReleaseInfo, String>),
@@ -39,8 +41,15 @@ pub struct GScrcpyApp {
     /// mDNS 服务缓存（ip:port -> mDNS 串号反查用，60s 刷新）
     mdns_map: Vec<MdnsService>,
     mdns_map_at: std::time::Instant,
+    /// 已执行过手势重置的设备（每台只重置一次，避免每次刷新重复执行）
+    gesture_restored: HashSet<String>,
 
-    packages: Vec<String>,
+    /// 机主应用列表（含手机端显示名，来自 scrcpy --list-apps）
+    apps: Vec<AppInfo>,
+    /// 分身用户应用：(用户id, 用户名, 包名)
+    clone_pkgs: Vec<(i32, String, String)>,
+    /// 当前类名对应的用户（Some=分身用户，None=机主）
+    selected_app_user: Option<i32>,
     package_filter: String,
     packages_loading: bool,
 
@@ -86,7 +95,10 @@ impl GScrcpyApp {
             action_error: false,
             mdns_map: Vec::new(),
             mdns_map_at: std::time::Instant::now(),
-            packages: Vec::new(),
+            gesture_restored: HashSet::new(),
+            apps: Vec::new(),
+            clone_pkgs: Vec::new(),
+            selected_app_user: None,
             package_filter: String::new(),
             packages_loading: false,
             app_input: String::new(),
@@ -251,17 +263,77 @@ impl GScrcpyApp {
     fn load_packages(&mut self) {
         let Some(serial) = self.selected_serial.clone() else { return };
         let Some(adb_path) = self.adb_path.clone() else { return };
+        let scrcpy_dir = self.scrcpy_dir.clone();
         self.packages_loading = true;
+        self.apps.clear();
+        self.clone_pkgs.clear();
+        self.selected_app_user = None;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let adb = Adb::new(adb_path);
-            let pkgs = adb.packages(&serial);
-            let _ = tx.send(Msg::Packages(serial, pkgs));
+            // 优先用 scrcpy --list-apps（一次返回包名+手机端显示名）；
+            // scrcpy 不可用时回退 pm list packages（无名字）
+            let apps = match &scrcpy_dir {
+                Some(dir) => {
+                    let list = Scrcpy { dir: dir.clone() }.list_apps(&serial);
+                    if !list.is_empty() {
+                        list
+                    } else {
+                        adb.packages(&serial)
+                            .into_iter()
+                            .map(|p| AppInfo {
+                                name: String::new(),
+                                package: p,
+                                is_system: false,
+                            })
+                            .collect()
+                    }
+                }
+                None => adb
+                    .packages(&serial)
+                    .into_iter()
+                    .map(|p| AppInfo {
+                        name: String::new(),
+                        package: p,
+                        is_system: false,
+                    })
+                    .collect(),
+            };
+            // 分身用户（华为 user 128「分身应用」/ 努比亚 user 999「应用分身」等）
+            let mut user_pkgs: Vec<(i32, String, Vec<String>)> = Vec::new();
+            for u in adb.users(&serial) {
+                let ps = adb.packages_for_user(&serial, u.id);
+                if !ps.is_empty() {
+                    user_pkgs.push((u.id, u.name.clone(), ps));
+                }
+            }
+            let _ = tx.send(Msg::Packages(serial, apps, user_pkgs));
         });
     }
 
     fn apply_devices(&mut self, devs: Vec<DeviceInfo>) {
         self.devices = devs;
+        // 新出现的 device 状态设备：若开启自动恢复，执行手势重置（每台设备只恢复一次）
+        if self.config.restore_gesture {
+            let adb_path = self.adb_path.clone();
+            for dev in &self.devices {
+                if dev.state == "device" && self.gesture_restored.insert(dev.serial.clone()) {
+                    let tx = self.tx.clone();
+                    let serial = dev.serial.clone();
+                    if let Some(adb_path) = adb_path.clone() {
+                        std::thread::spawn(move || {
+                            let adb = Adb::new(adb_path);
+                            let r = adb.restore_gesture_settings(&serial);
+                            let msg = format!(
+                                "[手势重置] {serial}: {}",
+                                r.unwrap_or_else(|e| e)
+                            );
+                            let _ = tx.send(Msg::Log(msg));
+                        });
+                    }
+                }
+            }
+        }
         // 上次选中的设备还在，则保持
         if let Some(sel) = &self.selected_serial {
             if !self.devices.iter().any(|d| &d.serial == sel) {
@@ -423,7 +495,32 @@ impl GScrcpyApp {
             },
             self.device_display(&serial)
         );
-        let args = scrcpy.build_args(&serial, &pkg, &res, ww, wh, &title);
+        // 分身场景：scrcpy 4.x 不支持 --user，先 am start 启动指定用户的应用，
+        // 再让 scrcpy 不带 --start-app 直接投屏
+        let clone_user = self.selected_app_user;
+        if let Some(uid) = clone_user {
+            let Some(adb) = self.adb() else {
+                self.action_status = "未找到 adb".into();
+                self.action_error = true;
+                return;
+            };
+            let Some(component) = adb.resolve_activity(&serial, uid, &pkg) else {
+                self.action_status =
+                    format!("分身(user {uid})中未找到应用 {pkg}，请确认已创建分身").into();
+                self.action_error = true;
+                return;
+            };
+            match adb.start_app_for_user(&serial, uid, &component) {
+                Ok(o) => self.log(format!("已在分身(user {uid})启动 {component}：{o}")),
+                Err(e) => {
+                    self.action_status = format!("分身启动失败: {e}");
+                    self.action_error = true;
+                    return;
+                }
+            }
+        }
+        let start_app = if clone_user.is_some() { None } else { Some(pkg.as_str()) };
+        let args = scrcpy.build_args(&serial, start_app, &res, ww, wh, &title);
         self.log(format!(
             "启动: {} {}",
             scrcpy.exe().display(),
@@ -503,11 +600,22 @@ impl GScrcpyApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Devices(devs) => self.apply_devices(devs),
-                Msg::Packages(serial, pkgs) => {
+                Msg::Packages(serial, apps, user_pkgs) => {
                     if self.selected_serial.as_deref() == Some(serial.as_str()) {
-                        self.packages = pkgs;
+                        self.apps = apps;
+                        self.clone_pkgs = user_pkgs
+                            .iter()
+                            .flat_map(|(id, uname, ps)| {
+                                ps.iter().map(move |p| (*id, uname.clone(), p.clone()))
+                            })
+                            .collect();
                         self.packages_loading = false;
-                        self.log(format!("已加载 {} 个应用", self.packages.len()));
+                        let n = self.clone_pkgs.len();
+                        self.log(format!(
+                            "已加载 {} 个应用（含 {} 个分身应用）",
+                            self.apps.len() + n,
+                            n
+                        ));
                     }
                 }
                 Msg::ScrcpyVersion(v) => self.scrcpy_version = v,
@@ -651,6 +759,13 @@ impl GScrcpyApp {
             }
             ui.label(format!("自动刷新 · 共 {} 台", self.devices.len()));
         });
+        if ui
+            .checkbox(&mut self.config.restore_gesture, "连接后自动重置手势导航")
+            .on_hover_text("修复部分机型（如华为）无线调试连接后侧滑/从底部滑动失效；每台设备连接时自动执行一次")
+            .changed()
+        {
+            self.config.save();
+        }
 
         let mut to_select: Option<String> = None;
         // 主列表过滤掉模拟器与本机回环连接（127.0.0.1）的设备，被过滤的单独展示在折叠区
@@ -683,7 +798,9 @@ impl GScrcpyApp {
                 self.selected_serial = Some(serial.clone());
                 self.config.last_serial = Some(serial);
                 self.config.save();
-                self.packages.clear();
+                self.apps.clear();
+                self.clone_pkgs.clear();
+                self.selected_app_user = None;
                 self.load_packages();
             }
         }
@@ -803,6 +920,7 @@ impl GScrcpyApp {
 
         ui.horizontal(|ui| {
             ui.label("应用类名(包名):");
+            let sel_user = self.selected_app_user;
             egui::ComboBox::from_id_salt("app_history")
                 .selected_text(if self.app_input.is_empty() {
                     "历史记录…".to_string()
@@ -817,14 +935,26 @@ impl GScrcpyApp {
                     for item in self.config.app_history.clone() {
                         if ui.selectable_label(self.app_input == item, &item).clicked() {
                             self.app_input = item;
+                            self.selected_app_user = None;
                         }
                     }
                 });
-            ui.add(
+            let app_resp = ui.add(
                 egui::TextEdit::singleline(&mut self.app_input)
                     .hint_text("如 com.gof.china")
                     .desired_width(260.0),
             );
+            if app_resp.changed() {
+                // 手动输入/修改时视为机主应用
+                self.selected_app_user = None;
+            }
+            if let Some(uid) = sel_user {
+                ui.label(
+                    egui::RichText::new(format!("分身 user {uid}"))
+                        .small()
+                        .color(egui::Color32::from_rgb(255, 190, 90)),
+                );
+            }
         });
         ui.horizontal(|ui| {
             ui.label("显示名(可选):");
@@ -901,8 +1031,18 @@ impl GScrcpyApp {
                     let label = self.app_label_input.trim().to_string();
                     let name = if label.is_empty() { pkg.as_str() } else { label.as_str() };
                     let title = format!("{name} - {}", self.device_display(s));
-                    if let Some(scrcpy) = self.scrcpy() {
-                        let args = scrcpy.build_args(s, &pkg, &res, ww, wh, &title);
+                    let clone_user = self.selected_app_user;
+                    if let Some(uid) = clone_user {
+                        ui.monospace(format!(
+                            "adb -s {s} shell am start --user={uid} -n <{pkg}的Activity>"
+                        ));
+                        ui.monospace("adb -s {s} shell cmd package resolve-activity --user={uid} --brief {pkg}  # 解析 Activity");
+                        if let Some(scrcpy) = self.scrcpy() {
+                            let args = scrcpy.build_args(s, None, &res, ww, wh, &title);
+                            ui.monospace(format!("scrcpy {}", args.join(" ")));
+                        }
+                    } else if let Some(scrcpy) = self.scrcpy() {
+                        let args = scrcpy.build_args(s, Some(&pkg), &res, ww, wh, &title);
                         ui.monospace(format!("scrcpy {}", args.join(" ")));
                     }
                 }
@@ -924,25 +1064,99 @@ impl GScrcpyApp {
             }
         });
         let filter = self.package_filter.to_lowercase();
-        let filtered: Vec<String> = self
-            .packages
+        let filtered: Vec<AppInfo> = self
+            .apps
             .iter()
-            .filter(|p| filter.is_empty() || p.to_lowercase().contains(&filter))
+            .filter(|a| {
+                filter.is_empty()
+                    || a.package.to_lowercase().contains(&filter)
+                    || a.name.to_lowercase().contains(&filter)
+            })
             .cloned()
             .collect();
-        ui.label(format!("共 {} 个", filtered.len()));
+        ui.label(format!("共 {} 个（可搜应用名或包名）", filtered.len()));
         egui::ScrollArea::vertical()
             .max_height(360.0)
             .show(ui, |ui| {
-                for pkg in filtered {
-                    if ui.selectable_label(false, &pkg).clicked() {
-                        self.copy_text(&pkg);
-                        self.app_input = pkg.clone();
-                        if self.app_label_input.is_empty() {
-                            self.app_label_input = pkg.clone();
+                for app in filtered {
+                    let is_sel =
+                        self.app_input == app.package && self.selected_app_user.is_none();
+                    let text = if app.name.is_empty() {
+                        app.package.clone()
+                    } else {
+                        format!("{}  {}", app.name, app.package)
+                    };
+                    if ui.selectable_label(is_sel, text).clicked() {
+                        self.copy_text(&app.package);
+                        self.app_input = app.package.clone();
+                        self.selected_app_user = None;
+                        // 手机端显示名自动填入「显示名」，无需手动填写
+                        if !app.name.is_empty() {
+                            self.app_label_input = app.name.clone();
+                            self.config
+                                .app_labels
+                                .insert(app.package.clone(), app.name.clone());
+                            self.config.save();
+                        } else if self.app_label_input.is_empty() {
+                            self.app_label_input = app.package.clone();
                         }
-                        self.log(format!("已复制并填入: {pkg}"));
+                        self.log(format!(
+                            "已复制并填入: {}{}",
+                            app.name,
+                            if app.name.is_empty() {
+                                String::new()
+                            } else {
+                                format!("（{}）", app.package)
+                            }
+                        ));
                     }
+                }
+                // 分身应用分区（华为 user 128 / 努比亚 user 999 等），按用户分组
+                let clone_filtered: Vec<(i32, String, String)> = self
+                    .clone_pkgs
+                    .iter()
+                    .filter(|(_, _, p)| filter.is_empty() || p.to_lowercase().contains(&filter))
+                    .cloned()
+                    .collect();
+                if !clone_filtered.is_empty() {
+                    ui.separator();
+                    egui::CollapsingHeader::new(format!(
+                        "分身应用（{} 个）",
+                        clone_filtered.len()
+                    ))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let mut groups: Vec<(i32, String, Vec<String>)> = Vec::new();
+                        for (uid, uname, pkg) in clone_filtered {
+                            match groups.iter_mut().find(|(id, _, _)| *id == uid) {
+                                Some((_, _, ps)) => ps.push(pkg),
+                                None => groups.push((uid, uname, vec![pkg])),
+                            }
+                        }
+                        for (uid, uname, pkgs) in groups {
+                            ui.label(
+                                egui::RichText::new(format!("{uname}（user {uid}）"))
+                                    .strong()
+                                    .small(),
+                            );
+                            for pkg in pkgs {
+                                let is_sel =
+                                    self.app_input == pkg && self.selected_app_user == Some(uid);
+                                let text = format!("{pkg}  [分身 user {uid}]");
+                                if ui.selectable_label(is_sel, text).clicked() {
+                                    self.copy_text(&pkg);
+                                    self.app_input = pkg.clone();
+                                    self.selected_app_user = Some(uid);
+                                    if self.app_label_input.is_empty() {
+                                        self.app_label_input = pkg.clone();
+                                    }
+                                    self.log(format!(
+                                        "已复制并填入分身: {pkg} (user {uid})"
+                                    ));
+                                }
+                            }
+                        }
+                    });
                 }
             });
     }

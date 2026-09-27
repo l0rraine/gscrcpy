@@ -38,6 +38,13 @@ pub struct Config {
     /// 上次使用的显示名
     #[serde(default)]
     pub last_app_label: Option<String>,
+    /// 设备连接上之后自动重置手势导航（修复部分机型无线调试后侧滑/底部滑动失效）
+    #[serde(default = "default_true")]
+    pub restore_gesture: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_window_width() -> u32 {
@@ -61,6 +68,7 @@ impl Default for Config {
             last_app: None,
             last_resolution: None,
             last_app_label: None,
+            restore_gesture: true,
         }
     }
 }
