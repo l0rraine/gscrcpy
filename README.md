@@ -38,4 +38,15 @@ cargo build --release
 - `--new-display`（虚拟显示器）需要 Android 12+
 - 无线配对要求手机与电脑在同一局域网，且 mDNS（UDP 5353）未被防火墙拦截
 - scrcpy 运行日志写入 `%APPDATA%/gscrcpy/scrcpy.log`
-- 更新 scrcpy 走 GitHub Releases；国内网络若下载慢，可手动下载 zip 后用「选择 scrcpy 目录…」指定
+- 更新 scrcpy 走 GitHub Releases；国内网络若下载慢，可手动下载 scrcpy-win64 zip，解压到 exe 旁的 `tools/` 目录（程序会自动发现 scrcpy.exe 与 adb.exe）
+
+## 发布新版本
+
+推送 `vx.x.x` 样式的 tag 即触发 GitHub Actions 自动构建并创建 Release（含 exe 与 zip 产物）：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Workflow：`.github/workflows/release.yml`（仅匹配 `v*.*.*` 格式的 tag）。

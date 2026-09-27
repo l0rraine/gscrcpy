@@ -1,0 +1,46 @@
+name: Release
+
+# 只在推送 vx.x.x 样式的版本 tag 时触发（如 v1.0.0、v2.3.4）
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write # 创建 GitHub Release 需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable / MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package zip (exe + README)
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force package
+          Copy-Item target/release/gscrcpy.exe package/
+          Copy-Item README.md package/
+          Compress-Archive -Path package/* -DestinationPath "gscrcpy-$tag-windows-x64.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/gscrcpy.exe
+            gscrcpy-${{ github.ref_name }}-windows-x64.zip
+          generate_release_notes: true
