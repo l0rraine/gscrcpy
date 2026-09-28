@@ -31,3 +31,39 @@
 | **去掉左栏日志和修复按钮** | 启动失败后要求去掉左侧的日志和修复手机手势，明确是**连接下方的日志区** |
 | **二维码区收窄** | "无线调试配对右边的？没起作用。把二维码那除了二维码之外的内容都放到？里" |
 | **确认启动逻辑** | 手势修复执行时机曾被调整（启动前 → 投屏后 → 回到启动前），需要重新确认 |
+
+
+## 四、2026-09-29 三栏重构 + 多轮联调修复（已交付，等最终确认后提交）
+
+> 对应 git 工作区全部未提交改动：`src/app.rs`、`src/config.rs`、`src/pairing.rs`、`src/mdns.rs`、`src/scrcpy.rs`、`Cargo.toml`、`build.rs`、`assets/gscrcpy.ico`。
+
+### 1. Profile 三栏重构（实现最初主需求）
+- **左栏**：设备列表 + 连接/二维码区（收窄）；scrcpy 版本信息与日志移到最下方。
+- **中栏**：当前设备的多个 Profile 列表，支持增加、删除、改名。
+- **右栏**：Profile 编辑（应用选择、分辨率、窗口标题、两个启动按钮）。
+- **Profile 与设备多对一**，按**串号**（含 mDNS 串号后缀）存储。
+
+### 2. UI/交互修复清单（逐项验收通过）
+| 项 | 说明 |
+|---|---|
+| **常驻改名输入区** | Profile 名默认只读；点「改名」→ 输入框自动填入并聚焦，✔/回车保存、×取消；改名/删除按钮靠右对齐 |
+| **自建应用下拉框** | 标准 ComboBox 内嵌过滤框点击必关菜单（egui 框架行为），改为 Button + Area 弹层；顶部过滤框可输入；机主/分身分区显示；显示「名字 包名」，分身标注 `[分身 {uname}]`；弹层加高 360px；外部点击按 `press_origin` 判定关闭 |
+| **删除按钮图标** | 修复显示异常，统一用 × 风格图标 |
+| **配对链路重写（对照 escrcpy）** | 每次配对建立全新 mDNS 探测（PairProbe，对齐 escrcpy fresh Bonjour）；配对失败服务立即移出候选；connect 服务等不到时 fallback 5555 直连。用户确认「连接没问题了」 |
+| **Profile 自动迁移** | 重新配对后 mDNS 串号后缀会变 → 按**物理串号**（`physical_serial`）自动复制 profile（`copy_profiles`），active_profile 指向新串号 |
+| **屏蔽 IP 格式设备复选框** | 纯 IP 设备与 127.0.0.1 模拟器统一由复选框控制：勾选 → 折叠「已过滤」区；取消勾选 → 全部显示主列表。`emulator-` 前缀始终折叠 |
+| **模拟器自动发现** | 每 10 秒定时探测本机常见模拟器端口（MuMu 7555/16384/16385、通用 5555/5554，仅 127.0.0.1）并自动 `adb connect`，5 秒探测冷却；打开模拟器后设备自动出现 |
+| **刷新提速** | adb track-devices 事件驱动（500ms 去抖）+ 10 秒定时 tick 兜底 |
+| **应用图标** | winres 嵌入 exe 图标 `assets/gscrcpy.ico`（手机→显示器投屏主题，256/48/32/16 多尺寸） |
+
+### 3. 关键技术坑位（避免重试）
+- egui 0.36.2 帧内 `Context::write`/`memory_mut` 触发 panic → 安全聚焦用 `Response::request_focus()`。
+- egui 标准 ComboBox 菜单内嵌输入框点击必关菜单；`Area` 的 `hovered()` 不可靠 → 用 `press_origin()` + 弹层内容矩形。
+- 临时渲染 TextEdit 输入不同步（能移光标不能打字）→ 常驻输入区方案。
+- `src/app.rs`（~87KB）用 Edit/Write 工具间歇失败 → 全程 python 补丁脚本 + io 全量替换（幂等，重跑全 MISS 属正常）。
+- release 编译前 exe 被占用（os error 5）→ 桌面 MessageBox 弹窗请用户关闭；**绝不自行关闭 gscrcpy**（会连带关闭 MuMu/VMware）。
+- `adb track-devices` 只对已连接设备变化输出，对模拟器端口开关无感知 → 10 秒定时 tick 兜底。
+
+### 4. 测试基线
+- `cargo test` = 25/25（新增 `ip_serial_predicate`、`physical_serial_parses`、`copy_profiles_works` 等）。
+- debug 构建仅 1 个既有 warning（pairing.rs `service_instance` never read，可忽略）。

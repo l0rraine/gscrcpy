@@ -137,8 +137,9 @@ impl Scrcpy {
         parse_app_list_output(&text)
     }
 
-    /// 异步启动 scrcpy：无控制台窗口，日志追加到配置目录 scrcpy.log
-    pub fn launch(&self, args: &[String]) -> Result<(), String> {
+    /// 异步启动 scrcpy：无控制台窗口，日志追加到配置目录 scrcpy.log。
+    /// 返回子进程句柄，调用方可等待其退出（用于投屏结束后自动手势修复）。
+    pub fn launch(&self, args: &[String]) -> Result<std::process::Child, String> {
         let mut cmd = Command::new(self.exe());
         cmd.args(args);
         cmd.stdin(Stdio::null());
@@ -168,8 +169,7 @@ impl Scrcpy {
         // 指定使用与 scrcpy 同目录的 adb
         cmd.env("ADB", self.adb());
         cmd.spawn()
-            .map_err(|e| format!("启动 scrcpy 失败: {e}"))?;
-        Ok(())
+            .map_err(|e| format!("启动 scrcpy 失败: {e}"))
     }
 
     /// 创建虚拟显示器并投屏（分身场景）。
@@ -177,8 +177,14 @@ impl Scrcpy {
     /// 等待 scrcpy 在 stdout 输出 `displayId: N`（虚拟显示器创建成功的唯一标志），
     /// 解析返回显示器 ID，供 `am start-activity --display <id>` 使用。
     /// displayId 每次启动都动态变化，必须实时解析，不能硬编码。
-    pub fn launch_with_new_display(&self, args: &[String]) -> Result<i32, String> {
-        self.spawn_with_display(args).map(|(id, _child)| id)
+    /// 创建虚拟显示器并投屏（分身场景），返回显示器 ID 与子进程句柄：
+    /// ID 供 `am start-activity --display <id>` 使用，句柄供等待退出
+    /// （投屏结束后自动手势修复）。displayId 每次动态分配，必须实时解析。
+    pub fn launch_with_new_display_child(
+        &self,
+        args: &[String],
+    ) -> Result<(i32, std::process::Child), String> {
+        self.spawn_with_display(args)
     }
 
     /// 内部实现：spawn scrcpy 并解析虚拟显示器 ID，成功返回 `(display_id, child)`。

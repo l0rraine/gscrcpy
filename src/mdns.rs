@@ -83,6 +83,13 @@ impl MdnsCache {
             .find(|s| format!("{}:{}", s.host, s.port) == ip_port)
             .map(|s| s.instance)
     }
+
+    /// 移除指定服务（配对失败的服务从缓存清除，避免反复重试已失效广播）
+    pub fn remove_service(&self, instance: &str, service: &str) {
+        if let Ok(mut m) = self.inner.lock() {
+            m.remove(&format!("{instance}.{service}"));
+        }
+    }
 }
 
 impl Drop for MdnsCache {
@@ -133,7 +140,7 @@ fn drain_events(rx: &Receiver<ServiceEvent>, inner: &Arc<Mutex<HashMap<String, M
 /// 把 mdns-sd 的 ResolvedService 转成内部 MdnsService（取首个 IPv4 地址）。
 /// mdns-sd 的 ty_domain 形如 "_adb-tls-pairing._tcp.local."，服务类型要去掉
 /// ".local" 域名后缀，得到内部统一的 "_adb-tls-pairing._tcp"。
-fn resolved_to_service(rs: &ResolvedService) -> Option<MdnsService> {
+pub(crate) fn resolved_to_service(rs: &ResolvedService) -> Option<MdnsService> {
     if !rs.is_valid() {
         return None;
     }

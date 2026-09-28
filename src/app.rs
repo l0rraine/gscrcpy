@@ -1,14 +1,19 @@
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use eframe::egui;
 
-use crate::adb::{Adb, DeviceInfo};
-use crate::config::Config;
+use crate::adb::{Adb, DeviceInfo, CREATE_NO_WINDOW};
+use crate::config::{physical_serial, Config, GestureFixMode, Profile};
 use crate::mdns::MdnsCache;
 use crate::pairing::{self, PairingQr};
 use crate::scrcpy::{AppInfo, Scrcpy};
@@ -25,6 +30,8 @@ pub enum Msg {
     UpdateCheck(Result<updater::ReleaseInfo, String>),
     UpdateInstall(Result<PathBuf, String>),
     Log(String),
+    /// adb track-devices 检测到设备列表变化（主线程收到后重新拉取详情）
+    DevicesTick,
 }
 
 pub struct GScrcpyApp {
@@ -45,19 +52,28 @@ pub struct GScrcpyApp {
     mdns: MdnsCache,
     /// 已知设备物理分辨率缓存（wm size）
     device_sizes: HashMap<String, (u32, u32)>,
-    /// 已执行过手势重置的设备（每台只重置一次，避免每次刷新重复执行）
-    gesture_restored: HashSet<String>,
 
     /// 机主应用列表（含手机端显示名，来自 scrcpy --list-apps）
     apps: Vec<AppInfo>,
     /// 分身用户应用：(用户id, 用户名, 应用信息(含显示名))
     clone_pkgs: Vec<(i32, String, AppInfo)>,
-    /// 当前类名对应的用户（Some=分身用户，None=机主）
-    selected_app_user: Option<i32>,
+    packages_loading: bool,
+
+    /// 当前选中设备的 profile 列表（与 config.profiles 同步，中栏展示）
+    profiles: Vec<Profile>,
+    /// 当前编辑中的 profile 副本（右栏编辑，改动即保存回 config）
+    profile_edit: Option<Profile>,
     /// 最近一次成功解析的分身 Activity：(用户id, 包名, component)，用于命令预览
     last_resolved_component: Option<(i32, String, String)>,
-    package_filter: String,
-    packages_loading: bool,
+
+    /// 正在改名的 profile（None=无；列表默认只读，点「改名」才进入编辑）
+    renaming_profile: Option<String>,
+    /// 刚点「改名」进入编辑态，下一帧给输入框请求焦点（否则无法直接输入）
+    rename_focus_requested: bool,
+    /// 自建应用下拉弹层是否打开（点击弹层外自动关闭）
+    app_combo_open: bool,
+    /// 重命名输入框文本（常驻控件，文本存字段保证输入同步）
+    renaming_name: String,
 
     app_input: String,
     app_label_input: String,
@@ -65,10 +81,12 @@ pub struct GScrcpyApp {
     win_w_input: String,
     win_h_input: String,
 
-    logs: Vec<String>,
-
     qr: Option<PairingQr>,
     qr_texture: Option<egui::TextureHandle>,
+    /// 二维码区"？"帮助是否展开
+    qr_help_open: bool,
+    /// 二维码是否已失效（配对超时后置 true：二维码变灰、点击即可重新生成）
+    qr_expired: bool,
     pairing_cancel: Arc<AtomicBool>,
     pairing_status: String,
 
@@ -91,6 +109,10 @@ impl GScrcpyApp {
         if config.migrate_bad_defaults() {
             config.save();
         }
+        // 手势热区统一为 Auto（每次投屏结束自动修复）；旧配置保持其余字段不变
+        if config.migrate_all_gesture_auto() {
+            config.save();
+        }
         let (adb_path, scrcpy_dir) = discover_tools(&config);
         let (tx, rx) = channel();
         let mut app = Self {
@@ -108,21 +130,25 @@ impl GScrcpyApp {
             action_error: false,
             mdns: MdnsCache::start(),
             device_sizes: HashMap::new(),
-            gesture_restored: HashSet::new(),
             apps: Vec::new(),
             clone_pkgs: Vec::new(),
-            selected_app_user: None,
-            last_resolved_component: None,
-            package_filter: String::new(),
             packages_loading: false,
+            profiles: Vec::new(),
+            profile_edit: None,
+            last_resolved_component: None,
+            renaming_profile: None,
+            rename_focus_requested: false,
+            app_combo_open: false,
+            renaming_name: String::new(),
             app_input: String::new(),
             app_label_input: String::new(),
             resolution_input: String::new(),
             win_w_input: String::new(),
             win_h_input: String::new(),
-            logs: Vec::new(),
             qr: None,
             qr_texture: None,
+            qr_help_open: false,
+            qr_expired: false,
             pairing_cancel: Arc::new(AtomicBool::new(false)),
             pairing_status: String::new(),
             manual_ip: String::new(),
@@ -133,21 +159,10 @@ impl GScrcpyApp {
             update_status: String::new(),
             update_working: false,
         };
-        // 初始化输入（分辨率留空 = 直接镜像物理屏幕；窗口留空 = 自动）
-        app.app_input = app.config.last_app.clone().unwrap_or_default();
-        app.app_label_input = app.config.last_app_label.clone().unwrap_or_default();
-        app.resolution_input = app.config.last_resolution.clone().unwrap_or_default();
-        app.win_w_input = if app.config.window_width > 0 {
-            app.config.window_width.to_string()
-        } else {
-            String::new()
-        };
-        app.win_h_input = if app.config.window_height > 0 {
-            app.config.window_height.to_string()
-        } else {
-            String::new()
-        };
+        // 恢复上次设备；窗口尺寸默认留空（= 与分辨率相同，自动匹配）
         app.selected_serial = app.config.last_serial.clone();
+        app.win_w_input = String::new();
+        app.win_h_input = String::new();
 
         app.ensure_refresh();
         app.ensure_version_check();
@@ -155,7 +170,10 @@ impl GScrcpyApp {
         if app.adb_path.is_some() {
             app.start_pairing(&cc.egui_ctx);
         }
-        app.log("启动完成。");
+        // 若已选中设备，初始化其 profile 与应用列表
+        if let Some(serial) = app.selected_serial.clone() {
+            app.init_device_state(&serial);
+        }
         app
     }
 
@@ -178,6 +196,8 @@ impl GScrcpyApp {
         current_exe_dir().join("tools")
     }
 
+    // ---------- 刷新（adb track-devices 事件驱动，向 escrcpy 看齐） ----------
+
     fn ensure_refresh(&mut self) {
         if self.refresh_started {
             return;
@@ -185,19 +205,71 @@ impl GScrcpyApp {
         let Some(adb_path) = self.adb_path.clone() else { return };
         self.refresh_started = true;
         let tx = self.tx.clone();
+        // 定时刷新线程的独立 sender/stop（须在 move 进 track 线程前 clone）
+        let tx_tick = tx.clone();
+        let stop_tick = self.stop_refresh.clone();
         let stop = self.stop_refresh.clone();
         std::thread::spawn(move || {
-            let adb = Adb::new(adb_path);
             while !stop.load(Ordering::Relaxed) {
-                let devs = adb.devices();
-                let _ = tx.send(Msg::Devices(devs));
-                for _ in 0..30 {
+                // adb track-devices 持续输出设备状态变化（阻塞），断开后自动重连
+                let mut cmd = Command::new(&adb_path);
+                cmd.arg("track-devices");
+                cmd.stdin(Stdio::null());
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::null());
+                #[cfg(windows)]
+                cmd.creation_flags(CREATE_NO_WINDOW);
+                let Ok(mut child) = cmd.spawn() else {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                };
+                let Some(stdout) = child.stdout.take() else {
+                    let _ = child.kill();
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                };
+                let reader = std::io::BufReader::new(stdout);
+                let mut last_event = Instant::now();
+                for line in reader.lines() {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    let Ok(line) = line else { break };
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with("List of devices") {
+                        continue;
+                    }
+                    // 设备行变化即触发详情刷新；去抖 500ms，避免连发
+                    if last_event.elapsed() >= Duration::from_millis(500) {
+                        let _ = tx.send(Msg::DevicesTick);
+                        last_event = Instant::now();
+                    }
                 }
+                // track 流结束（adb 退出/设备断开）后稍等重连
+                std::thread::sleep(Duration::from_millis(1500));
             }
+        });
+        // 每 10 秒发一次定时刷新：adb 对模拟器端口开关无感知（track-devices 只在
+        // 已连接设备变化时输出），定时探测可让打开模拟器后自动出现在列表
+        std::thread::spawn(move || {
+            while !stop_tick.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(10));
+                let _ = tx_tick.send(Msg::DevicesTick);
+            }
+        });
+        // 启动后立即拉一次设备列表
+        self.refresh_once();
+    }
+
+    fn refresh_once(&mut self) {
+        let Some(adb_path) = self.adb_path.clone() else { return };
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let adb = Adb::new(adb_path);
+            // 自动探测本机常见模拟器 adb 端口（MuMu 等），
+            // 打开模拟器后无需手动 adb connect 即可在列表出现
+            try_connect_local_emulators(&adb);
+            let _ = tx.send(Msg::Devices(adb.devices()));
         });
     }
 
@@ -211,13 +283,6 @@ impl GScrcpyApp {
     }
 
     // ---------- 工具 ----------
-
-    fn log(&mut self, msg: impl Into<String>) {
-        self.logs.push(msg.into());
-        if self.logs.len() > 300 {
-            self.logs.drain(0..self.logs.len() - 300);
-        }
-    }
 
     fn copy_text(&mut self, text: &str) {
         match arboard::Clipboard::new() {
@@ -243,8 +308,6 @@ impl GScrcpyApp {
             .iter()
             .find(|d| d.serial == serial)
             .and_then(|d| d.model.clone());
-        // 手动连接/断开重连后设备以 ip:port 出现，别名仍挂在 mDNS 串号上，
-        // 尝试反查 mDNS 实例名以复用别名
         if is_ip_serial(serial) {
             if let Some(mdns) = self.ip_to_mdns_serial(serial) {
                 return self.config.display_name(&mdns, model.as_deref());
@@ -254,21 +317,150 @@ impl GScrcpyApp {
     }
 
     /// 通过自建 mDNS 缓存把 ip:port 反查为 mDNS 串号
-    /// （形如 "adb-XXX._adb-tls-connect._tcp"，与 adb devices -l 里的串号一致）
     fn ip_to_mdns_serial(&self, ip_port: &str) -> Option<String> {
         self.mdns
             .ip_to_instance(ip_port)
             .map(|instance| format!("{instance}.{}", crate::mdns::CONNECT_TYPE))
     }
 
-    fn refresh_once(&mut self) {
-        let Some(adb_path) = self.adb_path.clone() else { return };
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let adb = Adb::new(adb_path);
-            let _ = tx.send(Msg::Devices(adb.devices()));
-        });
+    // ---------- Profile / 设备状态 ----------
+
+    /// 选中设备后的初始化：迁移旧参数、同步 profile 列表、加载应用列表
+    fn init_device_state(&mut self, serial: &str) {
+        // 重新配对后 mDNS 串号后缀会变：先按物理串号复制旧 profile，
+        // 避免设备重连后"显示新的空白 profile"
+        self.ensure_profiles_for_serial(serial);
+        // 首次出现该设备：把旧版 last_app/last_resolution 等迁移进默认 profile
+        if self.config.migrate_legacy_into_default_profile(serial) {
+            self.config.save();
+        }
+        self.sync_profiles(serial);
+        self.load_packages();
     }
+
+    /// 重新配对后 mDNS 串号后缀会变（adb-<物理串号>-<随机后缀>），新串号下没有
+    /// profile 时按物理串号匹配并复制旧串号的 profiles，避免"显示新的空白配置"。
+    fn ensure_profiles_for_serial(&mut self, serial: &str) {
+        if self.config.profiles.contains_key(serial) {
+            return;
+        }
+        let phys = physical_serial(serial);
+        let old = self
+            .config
+            .profiles
+            .iter()
+            .filter(|(k, v)| *k != serial && physical_serial(k) == phys && !v.is_empty())
+            .map(|(k, _)| k.clone())
+            .next();
+        if let Some(old) = old {
+            if self.config.copy_profiles(&old, serial) {
+                self.config.save();
+            }
+        }
+    }
+
+    /// 从 config 同步当前设备的 profile 列表与编辑副本
+    fn sync_profiles(&mut self, serial: &str) {
+        self.profiles = self.config.profiles_for(serial).to_vec();
+        let active = self
+            .config
+            .active_profile_for(serial)
+            .cloned()
+            .unwrap_or_else(Profile::default);
+        self.profile_edit = Some(active);
+        // 同步输入框（编辑副本 -> 输入框）
+        // app_input 现在是下拉菜单内的过滤词，切换 profile 时清空
+        self.app_input.clear();
+        self.app_label_input = self
+            .profile_edit
+            .as_ref()
+            .map(|p| p.app_label.clone())
+            .unwrap_or_default();
+        self.resolution_input = self
+            .profile_edit
+            .as_ref()
+            .map(|p| p.resolution.clone())
+            .unwrap_or_default();
+    }
+
+    /// 把当前编辑副本写回 config（按名字定位），并保存
+    fn save_profile_edit(&mut self, serial: &str) {
+        let Some(edit) = self.profile_edit.clone() else { return };
+        let Some(list) = self.config.profiles_for_mut(serial) else { return };
+        if let Some(p) = list.iter_mut().find(|p| p.name == edit.name) {
+            *p = edit.clone();
+        } else {
+            // 找不到（名字被删/改名）→ 追加
+            list.push(edit.clone());
+        }
+        self.config.active_profile = Some((serial.to_string(), edit.name.clone()));
+        self.config.save();
+    }
+
+    /// 新增一个 profile 并选中
+    fn add_profile(&mut self, serial: &str) {
+        let n = self.profiles.len() + 1;
+        let name = format!("配置 {n}");
+        let p = Profile {
+            name: name.clone(),
+            ..Profile::default()
+        };
+        let list = self.config.profiles.entry(serial.to_string()).or_default();
+        list.push(p);
+        self.config.active_profile = Some((serial.to_string(), name));
+        self.config.save();
+        self.sync_profiles(serial);
+    }
+
+    /// 删除当前选中的 profile（按名字）
+    fn delete_profile(&mut self, serial: &str, name: &str) {
+        if let Some(list) = self.config.profiles_for_mut(serial) {
+            list.retain(|p| p.name != name);
+        }
+        // 单独更新 active_profile（避免同时可变借用）
+        let fallback = self
+            .config
+            .profiles_for(serial)
+            .first()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        if let Some(active) = &mut self.config.active_profile {
+            if active.1 == name {
+                *active = (serial.to_string(), fallback);
+            }
+        }
+        self.config.save();
+        self.sync_profiles(serial);
+    }
+
+    /// 中栏 profile 改名（直接编辑）：同步 config + 本地列表 + 编辑副本
+    fn rename_profile(&mut self, serial: &str, old: &str, new: &str) {
+        let new = new.trim().to_string();
+        if new.is_empty() || new == old {
+            // 空名或未变化：还原编辑框
+            self.sync_profiles(serial);
+            return;
+        }
+        if let Some(list) = self.config.profiles_for_mut(serial) {
+            if let Some(p) = list.iter_mut().find(|p| p.name == old) {
+                p.name = new.clone();
+            }
+            if let Some(active) = &mut self.config.active_profile {
+                if active.1 == old {
+                    active.1 = new.clone();
+                }
+            }
+            self.config.save();
+        }
+        if let Some(edit) = &mut self.profile_edit {
+            if edit.name == old {
+                edit.name = new.clone();
+            }
+        }
+        self.sync_profiles(serial);
+    }
+
+    // ---------- 应用列表 ----------
 
     fn load_packages(&mut self) {
         let Some(serial) = self.selected_serial.clone() else { return };
@@ -277,12 +469,10 @@ impl GScrcpyApp {
         self.packages_loading = true;
         self.apps.clear();
         self.clone_pkgs.clear();
-        self.selected_app_user = None;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let adb = Adb::new(adb_path);
-            // 优先用 scrcpy --list-apps（一次返回包名+手机端显示名）；
-            // scrcpy 不可用时回退 pm list packages（无名字）
+            // 优先用 scrcpy --list-apps（一次返回包名+手机端显示名）
             let apps = match &scrcpy_dir {
                 Some(dir) => {
                     let list = Scrcpy { dir: dir.clone() }.list_apps(&serial);
@@ -310,8 +500,7 @@ impl GScrcpyApp {
                     .collect(),
             };
             // 分身用户（华为 user 128「分身应用」/ 努比亚 user 999「应用分身」等）。
-            // 与 escrcpy 一致：只列三方应用 + 有桌面启动入口的应用，
-            // 显示名直接复用主用户(user 0)里同包名的名字。
+            // 显示名复用主用户(user 0)里同包名的名字。
             let base_name: HashMap<&str, &str> = apps
                 .iter()
                 .filter(|a| !a.name.is_empty())
@@ -323,7 +512,6 @@ impl GScrcpyApp {
                 if pkgs.is_empty() {
                     continue;
                 }
-                // 只保留有启动入口的应用（query-activities 失败时退回全量）
                 let launchable = adb.launchable_packages(&serial, u.id);
                 let keep: Vec<String> = if launchable.is_empty() {
                     pkgs
@@ -352,38 +540,19 @@ impl GScrcpyApp {
 
     fn apply_devices(&mut self, devs: Vec<DeviceInfo>) {
         self.devices = devs;
-        // 新出现的 device 状态设备：若开启自动恢复，执行手势重置（每台设备只恢复一次）
-        if self.config.restore_gesture {
-            let adb_path = self.adb_path.clone();
-            for dev in &self.devices {
-                if dev.state == "device" && self.gesture_restored.insert(dev.serial.clone()) {
-                    let tx = self.tx.clone();
-                    let serial = dev.serial.clone();
-                    if let Some(adb_path) = adb_path.clone() {
-                        std::thread::spawn(move || {
-                            let adb = Adb::new(adb_path);
-                            let r = adb.restore_gesture_settings(&serial);
-                            let msg = format!(
-                                "[手势重置] {serial}: {}",
-                                r.unwrap_or_else(|e| e)
-                            );
-                            let _ = tx.send(Msg::Log(msg));
-                        });
-                    }
-                }
-            }
-        }
-        // 同一手机同时出现 mDNS 串号 + ip:port 时，只保留串号条目（ip 条目判为重复）
+        // 同一手机同时出现 mDNS 串号 + ip:port 时，只保留串号条目
         let duplicate_ips: HashSet<String> = self
             .devices
             .iter()
             .filter(|d| is_ip_serial(&d.serial))
             .filter_map(|d| {
                 let twin = self.ip_to_mdns_serial(&d.serial)?;
-                self.devices.iter().any(|x| x.serial == twin).then_some(d.serial.clone())
+                self.devices
+                    .iter()
+                    .any(|x| x.serial == twin)
+                    .then_some(d.serial.clone())
             })
             .collect();
-        // 上次选中的是 ip:port 且已被去重 → 迁移到串号条目
         if let Some(sel) = &self.selected_serial {
             if duplicate_ips.contains(sel) {
                 if let Some(twin) = self.ip_to_mdns_serial(sel) {
@@ -393,13 +562,26 @@ impl GScrcpyApp {
                 }
             }
         }
-        // 上次选中的设备还在（含迁移后的串号），则保持
         if let Some(sel) = &self.selected_serial {
             if !self.devices.iter().any(|d| &d.serial == sel) {
                 self.selected_serial = None;
             }
         }
-        // 顺便刷新已知设备分辨率（仅缓存缺失的，避免频繁 adb 调用）
+        // 首次出现设备且当前无选中 → 自动选中第一个可用设备
+        if self.selected_serial.is_none() {
+            let first = self
+                .devices
+                .iter()
+                .find(|d| d.state == "device")
+                .map(|d| d.serial.clone());
+            if let Some(s) = first {
+                self.selected_serial = Some(s.clone());
+                self.config.last_serial = Some(s.clone());
+                self.config.save();
+                self.init_device_state(&s);
+            }
+        }
+        // 刷新已知设备分辨率（仅缓存缺失的）
         let known: HashSet<String> = self.device_sizes.keys().cloned().collect();
         let need: Vec<String> = self
             .devices
@@ -420,28 +602,15 @@ impl GScrcpyApp {
         }
     }
 
-    /// 该串号是否在设备列表中被判为重复（同一手机的 ip:port 条目）
-    fn is_duplicate_serial(&self, serial: &str) -> bool {
-        if !is_ip_serial(serial) {
-            return false;
-        }
-        match self.ip_to_mdns_serial(serial) {
-            Some(twin) => self.devices.iter().any(|x| x.serial == twin),
-            None => false,
-        }
-    }
-
     /// 设备分区：主列表显示，还是折叠到"已过滤"区。
-    /// 判据：模拟器、本机回环、IP 格式设备（默认屏蔽，可开关）。
+    /// IP 格式设备（含 127.0.0.1 模拟器、与 mDNS 串号孪生的 IP 条目）统一由
+    /// 「屏蔽 IP 格式设备」复选框控制：勾选 → 折叠区；取消勾选 → 全部显示。
+    /// emulator- 前缀（AVD 模拟器别名）始终折叠。
     fn is_filtered_device(&self, serial: &str) -> bool {
-        if serial.starts_with("emulator-") || serial.starts_with("127.0.0.1:") {
+        if serial.starts_with("emulator-") {
             return true;
         }
         if is_ip_serial(serial) {
-            // 重复条目永远隐藏（只显示串号）；纯 IP 设备按开关决定
-            if self.is_duplicate_serial(serial) {
-                return true;
-            }
             return self.config.hide_ip_devices;
         }
         false
@@ -458,13 +627,10 @@ impl GScrcpyApp {
         let target = if serial.contains(':') {
             Some(serial.to_string())
         } else if serial.starts_with("adb-") {
-            // mDNS 串号 -> 解析为 ip:port（自建 mDNS 缓存）
             self.mdns
                 .services(crate::mdns::CONNECT_TYPE)
                 .into_iter()
-                .find(|s| {
-                    format!("{}.{}", s.instance, s.service) == serial
-                })
+                .find(|s| format!("{}.{}", s.instance, s.service) == serial)
                 .map(|s| format!("{}:{}", s.host, s.port))
         } else {
             None
@@ -494,7 +660,6 @@ impl GScrcpyApp {
             self.action_error = true;
             return;
         };
-        // 只有网络连接（ip:port 或 mDNS 串号）可以断开；USB/模拟器无需断开
         let is_network = serial.contains(':') || serial.starts_with("adb-");
         if !is_network {
             self.action_status = "本地/USB 设备无需断开（断开仅用于无线/网络连接）".into();
@@ -512,54 +677,6 @@ impl GScrcpyApp {
             }
         }
         self.refresh_once();
-    }
-
-    /// 手动修复手机手势热区（荣耀/华为设备专用）。
-    ///
-    /// 背景：荣耀 MagicOS 实测，虚拟显示器按非物理分辨率（如 1920x1280）创建后，
-    /// SystemUI 会把主屏手势热区（GestureNav）注册成虚拟显示器分辨率，导致手机本机
-    /// 部分区域手势失效（底部上滑/右侧滑动无效），且移除虚拟显示器也不恢复。
-    /// 本操作创建一次**物理分辨率**虚拟显示器再立即结束，手势热区即重新注册为
-    /// 物理屏幕尺寸并固化（此后无论投屏是否继续、是否移除，热区保持），
-    /// 手机手势恢复，无需重启手机。用户发现"触控/手势不正常"时手动点击执行。
-    fn action_repair_gesture(&mut self, serial: &str) {
-        let Some(adb) = self.adb() else {
-            self.action_status = "未找到 adb，请先安装 scrcpy".into();
-            self.action_error = true;
-            return;
-        };
-        if !adb.is_honor_device(serial) {
-            self.action_status = "该设备不是荣耀/华为机型，一般不需要此修复".into();
-            self.action_error = false;
-            self.log("跳过手势热区修复（非荣耀/华为设备）");
-            return;
-        }
-        let Some((w, h)) = adb.wm_size(serial) else {
-            self.action_status = "无法获取设备物理分辨率".into();
-            self.action_error = true;
-            return;
-        };
-        let Some(scrcpy) = self.scrcpy() else {
-            self.action_status = "未找到 scrcpy，请先设置 scrcpy 目录".into();
-            self.action_error = true;
-            return;
-        };
-        self.action_status = format!("正在修复手势热区（用物理分辨率 {w}x{h} 覆盖一次）...");
-        self.action_error = false;
-        self.log(format!("修复手势热区: 物理分辨率 {w}x{h}"));
-        match scrcpy.repair_gesture_hotzone(serial, w, h) {
-            Ok(()) => {
-                self.action_status =
-                    "手势热区已物理化修复：手机本机手势已恢复正常（投屏中/结束后均保持，无需重启手机）".into();
-                self.action_error = false;
-                self.log("手势热区物理化修复完成");
-            }
-            Err(e) => {
-                self.action_status = format!("手势热区修复失败: {e}");
-                self.action_error = true;
-                self.log(format!("手势热区修复失败: {e}"));
-            }
-        }
     }
 
     fn save_rename(&mut self, serial: &str) {
@@ -584,12 +701,13 @@ impl GScrcpyApp {
 
     fn start_pairing(&mut self, ctx: &egui::Context) {
         let Some(adb_path) = self.adb_path.clone() else {
-            self.log("未找到 adb，请先安装 scrcpy");
+            self.action_status = "未找到 adb，请先安装 scrcpy".into();
+            self.action_error = true;
             return;
         };
-        // 先取消上一次配对线程（防止旧线程继续等到超时）
         self.pairing_cancel.store(true, Ordering::Relaxed);
         self.pairing_cancel = Arc::new(AtomicBool::new(false));
+        self.qr_expired = false;
         let qr = pairing::generate();
         match pairing::qr_pixels(&qr.payload, 8) {
             Ok((w, h, px)) => {
@@ -601,16 +719,13 @@ impl GScrcpyApp {
                 ));
             }
             Err(e) => {
-                self.log(format!("生成二维码失败: {e}"));
+                self.action_status = format!("生成二维码失败: {e}");
+                self.action_error = true;
                 return;
             }
         }
         self.qr = Some(qr.clone());
         self.pairing_status = "等待手机扫码配对…（2 分钟内有效）".into();
-        self.log(format!(
-            "已生成配对二维码（密码 {}）。请在同一 WiFi 下，打开手机「开发者选项 → 无线调试 → 使用二维码配对设备」扫码。",
-            qr.password
-        ));
 
         let tx = self.tx.clone();
         let cancel = self.pairing_cancel.clone();
@@ -641,7 +756,6 @@ impl GScrcpyApp {
         };
         self.pairing_cancel.store(true, Ordering::Relaxed);
         self.pairing_cancel = Arc::new(AtomicBool::new(false));
-        self.log(format!("开始配对码配对: {hp}"));
         let tx = self.tx.clone();
         let cancel = self.pairing_cancel.clone();
         let mdns = self.mdns.clone();
@@ -657,39 +771,90 @@ impl GScrcpyApp {
 
     // ---------- 启动 scrcpy ----------
 
-    fn launch_scrcpy(&mut self) {
+    /// 取当前编辑中的 profile（无则默认空 profile）
+    fn current_profile(&self) -> Profile {
+        self.profile_edit.clone().unwrap_or_default()
+    }
+
+    /// 「启动 app」：按当前 profile 启动应用（机主/分身，虚拟显示器/直接镜像）
+    fn launch_profile_app(&mut self) {
         let Some(serial) = self.selected_serial.clone() else {
-            self.log("请先选择设备");
+            self.action_status = "请先选择设备".into();
+            self.action_error = true;
             return;
         };
-        let Some(scrcpy) = self.scrcpy() else {
-            self.log("未找到 scrcpy，请先安装/更新 scrcpy");
-            return;
-        };
-        let pkg = self.app_input.trim().to_string();
+        let profile = self.current_profile();
+        let pkg = profile.app.trim().to_string();
         if pkg.is_empty() {
-            self.log("请填写应用类名（包名）");
+            self.action_status = "请先在「应用」中选择要启动的 app".into();
+            self.action_error = true;
             return;
         }
-        let res = self.resolution_input.trim().to_string();
+        // 手势热区 Auto 模式：投屏**结束后**自动执行物理化修复（启动前修复会被
+        // 随后创建的非物理分辨率虚拟显示器再次污染，故放在 do_launch 中登记、
+        // 由 scrcpy 进程退出事件触发）。
+        self.do_launch(&serial, &profile, Some(&pkg));
+    }
+
+    /// 「映射屏幕」：不启动 app、不建虚拟显示器，直接镜像设备物理屏幕。
+    /// 窗口尺寸留空 = 自动匹配画面。
+    fn launch_mirror_screen(&mut self) {
+        let Some(serial) = self.selected_serial.clone() else {
+            self.action_status = "请先选择设备".into();
+            self.action_error = true;
+            return;
+        };
+        let profile = self.current_profile();
+        let Some(scrcpy) = self.scrcpy() else {
+            self.action_status = "未找到 scrcpy，请先安装/更新 scrcpy".into();
+            self.action_error = true;
+            return;
+        };
+        let title = format!(
+            "屏幕镜像 - {}",
+            self.device_display(&serial)
+        );
+        // 直接镜像物理屏幕：分辨率/窗口全部留空，不建虚拟显示器
+        let args = scrcpy.build_args(&serial, None, "", 0, 0, &title);
+        self.run_scrcpy(&scrcpy, &args, false, false);
+        self.persist_usage(&profile);
+    }
+
+    fn do_launch(&mut self, serial: &str, profile: &Profile, app: Option<&str>) {
+        let Some(scrcpy) = self.scrcpy() else {
+            self.action_status = "未找到 scrcpy，请先安装/更新 scrcpy".into();
+            self.action_error = true;
+            return;
+        };
+        let res = profile.resolution.trim().to_string();
         if !res.is_empty() && !valid_resolution(&res) {
-            self.log("分辨率格式应为 宽x高，例如 1920x1080（留空 = 直接镜像物理屏幕）");
+            self.action_status = "分辨率格式应为 宽x高，例如 1920x1080（留空 = 直接镜像物理屏幕）".into();
+            self.action_error = true;
             return;
         }
+        // 窗口默认与分辨率相同：未填窗口尺寸时取分辨率的宽高
         let ww: u32 = self.win_w_input.trim().parse().unwrap_or(0);
         let wh: u32 = self.win_h_input.trim().parse().unwrap_or(0);
-        let label = self.app_label_input.trim().to_string();
+        let (ww, wh) = if ww == 0 && wh == 0 && !res.is_empty() {
+            res.split_once('x')
+                .and_then(|(a, b)| a.parse::<u32>().ok().zip(b.parse::<u32>().ok()))
+                .unwrap_or((0, 0))
+        } else {
+            (ww, wh)
+        };
+        let label = profile.app_label.trim().to_string();
+        let pkg = app.unwrap_or("").to_string();
         let title = format!(
             "{} - {}",
             if label.is_empty() {
-                pkg.as_str()
+                if pkg.is_empty() { "屏幕镜像".to_string() } else { pkg.clone() }
             } else {
-                label.as_str()
+                label
             },
-            self.device_display(&serial)
+            self.device_display(serial)
         );
         // 诊断：设备物理分辨率 vs 请求分辨率 vs 窗口比例
-        let phys = self.device_sizes.get(&serial).copied();
+        let phys = self.device_sizes.get(serial).copied();
         let mut diag = String::from("画面参数: ");
         if let Some((pw, ph)) = phys {
             diag += &format!("设备物理分辨率 {pw}x{ph}");
@@ -715,148 +880,233 @@ impl GScrcpyApp {
         } else {
             diag += "；窗口自动匹配";
         }
-        self.log(diag);
-        // 启动前重置手势/触控设置（修复无线投屏后侧滑、点按失效；连接时也会自动执行一次，
-        // 这里在每次启动前再执行，防止设备重连/系统改动后手势又被切回三键）
-        let Some(adb) = self.adb() else {
-            self.action_status = "未找到 adb".into();
-            self.action_error = true;
-            return;
-        };
-        match adb.restore_gesture_settings(&serial) {
-            Ok(o) => self.log(o),
-            Err(e) => self.log(format!("重置手势设置失败: {e}")),
-        }
+        self.action_status = diag.clone();
+        self.action_error = false;
 
-        // 分身场景：
-        //   A) 虚拟显示器模式（默认，clone_direct_mirror=false，对齐 escrcpy）：
-        //      1) resolve-activity 解析分身 Activity（必须 --brief --components，MagicOS 实测）
-        //      2) 先启动 scrcpy --new-display 创建虚拟显示器，从输出解析出 displayId
-        //      3) am start-activity --user <id> --display <displayId> -n <component>
-        //      应用渲染到 scrcpy 窗口对应的虚拟显示器，手机主屏不受影响。
-        //      但 Android 系统手势层（边缘返回/底部上滑）只监听主显示器，
-        //      虚拟显示器投屏里系统手势不可用（scrcpy/escrcpy 均如此），用快捷键代替。
-        //   B) 直接镜像模式（clone_direct_mirror=true）：
-        //      分身应用在手机前台启动（真屏），scrcpy 直接镜像主屏，
-        //      系统手势可用，但手机屏幕会被应用占用。
-        let clone_user = self.selected_app_user;
+        // 分身场景（profile 记录了分身用户）
+        let clone_user = profile.clone_user;
         if let Some(uid) = clone_user {
-            let component = match adb.resolve_activity(&serial, uid, &pkg) {
-                Ok(c) => c,
-                Err(e) => {
-                    // 带真实原因，避免误导为"未创建分身"
-                    let msg = format!("分身(user {uid})解析启动 Activity 失败: {e}");
-                    self.action_status = msg.clone();
+            if app.is_none() {
+                // 映射屏幕 + 分身 profile：镜像主屏即可（分身信息仅用于启动 app）
+                let args = scrcpy.build_args(serial, None, &res, ww, wh, &title);
+                self.run_scrcpy(&scrcpy, &args, false, false);
+                self.persist_usage(profile);
+                return;
+            }
+            let component = match self.adb() {
+                Some(adb) => match adb.resolve_activity(serial, uid, &pkg) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let msg = format!("分身(user {uid})解析启动 Activity 失败: {e}");
+                        self.action_status = msg.clone();
+                        self.action_error = true;
+                        return;
+                    }
+                },
+                None => {
+                    self.action_status = "未找到 adb".into();
                     self.action_error = true;
-                    self.log(msg);
                     return;
                 }
             };
             self.last_resolved_component = Some((uid, pkg.clone(), component.clone()));
 
-            if self.config.clone_direct_mirror {
-                // 直接镜像模式：先在手机前台启动分身，再镜像主屏
-                match adb.start_app_for_user(&serial, uid, &component) {
-                    Ok(o) => self.log(format!("已在分身(user {uid})启动 {component}：{o}")),
-                    Err(e) => {
-                        self.action_status = format!("分身启动失败: {e}");
-                        self.action_error = true;
-                        return;
+            // 分身固定使用虚拟显示器模式：分身显示在 scrcpy 窗口、手机屏幕不被占用
+            // （投屏期间系统手势不可用，结束后由后台线程自动物理化修复）
+            {
+                // 分身虚拟显示器必须有分辨率：显式设置优先；为空时回退设备物理
+                // 分辨率（物理尺寸 VD 下手机本机手势也不受污染、scrcpy 触控正常）
+                let res = if res.is_empty() {
+                    let phys = self
+                        .device_sizes
+                        .get(serial)
+                        .copied()
+                        .or_else(|| self.adb().and_then(|a| a.wm_size(serial)));
+                    match phys {
+                        Some((w, h)) => {
+                            let r = format!("{w}x{h}");
+                            self.action_status = format!(
+                                "分身模式需虚拟显示器，分辨率留空已自动使用设备物理分辨率 {r}"
+                            );
+                            self.action_error = false;
+                            r
+                        }
+                        None => {
+                            self.action_status =
+                                "分身模式需要分辨率：请在上方「分辨率」填写，或确认设备已连接（留空无法创建虚拟显示器）".into();
+                            self.action_error = true;
+                            return;
+                        }
                     }
-                }
-                // 直接镜像：不建虚拟显示器，虚拟分辨率强制留空（忽略用户填的分辨率）
-                let args = scrcpy.build_args(&serial, None, "", ww, wh, &title);
-                self.log(format!(
-                    "启动: {} {}",
-                    scrcpy.exe().display(),
-                    args.join(" ")
-                ));
-                match scrcpy.launch(&args) {
-                    Ok(()) => {
-                        self.action_status = "直接镜像已启动：分身应用在手机前台运行（手机屏幕被占用），系统手势可用".into();
-                        self.action_error = false;
-                        self.log("scrcpy 已启动（直接镜像主屏）");
-                    }
-                    Err(e) => {
-                        self.action_status = format!("启动失败: {e}");
-                        self.action_error = true;
-                        self.log(e);
-                    }
-                }
-            } else {
-                // 虚拟显示器模式
-                let args = scrcpy.build_clone_args(&serial, &res, ww, wh, &title);
-                self.log(format!(
-                    "启动: {} {}",
-                    scrcpy.exe().display(),
-                    args.join(" ")
-                ));
-                let display_id = match scrcpy.launch_with_new_display(&args) {
-                    Ok(id) => id,
+                } else {
+                    res
+                };
+                let args = scrcpy.build_clone_args(serial, &res, ww, wh, &title);
+                let (display_id, _child) = match scrcpy.launch_with_new_display_child(&args) {
+                    Ok(v) => v,
                     Err(e) => {
                         let msg = format!("创建虚拟显示器失败（未启动分身应用）: {e}");
                         self.action_status = msg.clone();
                         self.action_error = true;
-                        self.log(msg);
                         return;
                     }
                 };
-                self.log(format!(
-                    "虚拟显示器已创建 id={display_id}，把分身应用投到该显示器（手机屏幕不受影响）"
-                ));
-                match adb.start_app_for_user_on_display(&serial, uid, &component, display_id) {
-                    Ok(o) => self.log(format!(
-                        "已在分身(user {uid})于显示器 {display_id} 启动 {component}：{o}"
-                    )),
-                    Err(e) => {
-                        self.action_status = format!("分身投屏启动失败: {e}");
+                match self.adb() {
+                    Some(adb) => match adb.start_app_for_user_on_display(
+                        serial,
+                        uid,
+                        &component,
+                        display_id,
+                    ) {
+                        Ok(o) => {
+                            self.action_status = format!(
+                                "已把分身(user {uid})投屏到虚拟显示器 id={display_id}（手机屏幕不受影响）。系统手势不可用（Android 平台限制）：鼠标右键=返回，Alt/Super+H=桌面，Alt/Super+S=最近任务。{o}"
+                            );
+                            self.action_error = false;
+                        }
+                        Err(e) => {
+                            self.action_status = format!("分身投屏启动失败: {e}");
+                            self.action_error = true;
+                            return;
+                        }
+                    },
+                    None => {
+                        self.action_status = "未找到 adb".into();
                         self.action_error = true;
                         return;
                     }
                 }
-                self.action_status = "分身已投屏到 scrcpy 虚拟显示器（手机屏幕不受影响）。系统手势不可用（Android 平台限制）：鼠标右键=返回，Alt/Super+H=桌面，Alt/Super+S=最近任务".into();
+                // 用户验证过的方案：分身投屏建立后，立刻创建一次物理尺寸虚拟显示器
+                // 再移除，把主屏手势热区固化为物理尺寸——投屏期间与结束后手机本机
+                // 手势都正常（无需等投屏结束再修）
+                if profile.gesture_fix != GestureFixMode::Off {
+                    self.repair_gesture_after_vd(serial);
+                }
+                self.persist_usage(profile);
+            }
+        } else if let Some(pkg) = app {
+            // 机主应用
+            let args = scrcpy.build_args(serial, Some(pkg), &res, ww, wh, &title);
+            let virtual_display = args.iter().any(|a| a.contains("--new-display"));
+            self.run_scrcpy(
+                &scrcpy,
+                &args,
+                virtual_display,
+                profile.gesture_fix != GestureFixMode::Off,
+            );
+            self.persist_usage(profile);
+        } else {
+            // 映射屏幕（无分身、无 app）
+            let args = scrcpy.build_args(serial, None, &res, ww, wh, &title);
+            let virtual_display = args.iter().any(|a| a.contains("--new-display"));
+            self.run_scrcpy(
+                &scrcpy,
+                &args,
+                virtual_display,
+                profile.gesture_fix != GestureFixMode::Off,
+            );
+            self.persist_usage(profile);
+        }
+    }
+
+    /// 投屏建立后立即执行的物理化手势修复（用户验证过的方案）：
+    /// 创建一次物理尺寸虚拟显示器再移除，把主屏手势热区固化为物理尺寸，
+    /// 投屏期间与结束后手机本机手势都正常。非荣耀设备自动跳过。
+    fn repair_gesture_after_vd(&mut self, serial: &str) {
+        let Some(adb) = self.adb() else {
+            self.action_status = "未找到 adb，无法物理化修复手势".into();
+            self.action_error = true;
+            return;
+        };
+        if !adb.is_honor_device(serial) {
+            return;
+        }
+        let Some((w, h)) = adb.wm_size(serial) else {
+            self.action_status = "无法获取设备物理分辨率，手势热区未能物理化修复".into();
+            self.action_error = true;
+            return;
+        };
+        let Some(scrcpy) = self.scrcpy() else {
+            self.action_status = "未找到 scrcpy，手势热区未能物理化修复".into();
+            self.action_error = true;
+            return;
+        };
+        self.action_status = format!("正在物理化修复手势热区（物理分辨率 {w}x{h} 覆盖一次）...");
+        self.action_error = false;
+        match scrcpy.repair_gesture_hotzone(serial, w, h) {
+            Ok(()) => {
+                self.action_status =
+                    "投屏已建立，手机手势热区已固化为物理尺寸，本机手势正常（无需重启手机）".into();
                 self.action_error = false;
             }
-        } else {
-            let args = scrcpy.build_args(&serial, Some(pkg.as_str()), &res, ww, wh, &title);
-            // 机主应用同样受虚拟显示器机制影响：填了分辨率=虚拟显示器投屏（系统手势不可用），留空=直接镜像（手势可用）
-            let virtual_display = args.iter().any(|a| a.contains("--new-display"));
-            self.log(format!(
-                "启动: {} {}",
-                scrcpy.exe().display(),
-                args.join(" ")
-            ));
-            match scrcpy.launch(&args) {
-                Ok(()) => {
-                    self.action_status = if virtual_display {
-                        "scrcpy 已启动（虚拟显示器模式，手机屏幕不受影响）。系统手势不可用（Android 平台限制）：鼠标右键=返回，Alt/Super+H=桌面，Alt/Super+S=最近任务".into()
-                    } else {
-                        "scrcpy 已启动（直接镜像模式，系统手势可用）".into()
-                    };
-                    self.action_error = false;
-                    self.log("scrcpy 已启动（详细日志见 scrcpy.log）");
-                }
-                Err(e) => {
-                    self.action_status = format!("启动失败: {e}");
-                    self.action_error = true;
-                    self.log(e);
-                }
+            Err(e) => {
+                self.action_status =
+                    format!("手势热区物理化修复失败: {e}（投屏结束或重启手机后可恢复）");
+                self.action_error = true;
             }
         }
+    }
 
-        // 持久化
-        Config::push_unique(&mut self.config.app_history, pkg.clone(), 20);
-        if !label.is_empty() {
-            self.config
-                .app_labels
-                .insert(pkg.clone(), label.clone());
+    fn run_scrcpy(
+        &mut self,
+        scrcpy: &Scrcpy,
+        args: &[String],
+        virtual_display: bool,
+        repair_now: bool,
+    ) {
+        self.action_status = if virtual_display {
+            "scrcpy 已启动（虚拟显示器模式，手机屏幕不受影响）。系统手势不可用（Android 平台限制）：鼠标右键=返回，Alt/Super+H=桌面，Alt/Super+S=最近任务".into()
+        } else {
+            "scrcpy 已启动（直接镜像模式，系统手势可用）".into()
+        };
+        self.action_error = false;
+        match scrcpy.launch(args) {
+            Ok(_child) => {
+                // 虚拟显示器模式：投屏建立后立即物理化修复手势热区
+                // （用户验证方案：物理尺寸 VD 创建再移除 → 热区固化，手机手势恢复）
+                if virtual_display && repair_now {
+                    if let Some(serial) = self.selected_serial.clone() {
+                        self.repair_gesture_after_vd(&serial);
+                    }
+                }
+            }
+            Err(e) => {
+                self.action_status = format!("启动失败: {e}");
+                self.action_error = true;
+            }
         }
-        Config::push_unique(&mut self.config.resolutions, res.clone(), 10);
-        self.config.last_app = Some(pkg);
-        self.config.last_resolution = Some(res);
-        self.config.window_width = ww;
-        self.config.window_height = wh;
-        self.config.last_app_label = if label.is_empty() { None } else { Some(label) };
+    }
+
+    fn persist_usage(&mut self, profile: &Profile) {
+        let Some(serial) = self.selected_serial.clone() else { return };
+        // 持久化：profile 编辑内容 + 应用/分辨率历史 + 全局窗口尺寸
+        self.save_profile_edit(&serial);
+        if !profile.app.is_empty() {
+            Config::push_unique(&mut self.config.app_history, profile.app.clone(), 20);
+            if !profile.app_label.is_empty() {
+                self.config
+                    .app_labels
+                    .insert(profile.app.clone(), profile.app_label.clone());
+            }
+        }
+        Config::push_unique(&mut self.config.resolutions, profile.resolution.clone(), 10);
+        self.config.last_app = if profile.app.is_empty() {
+            None
+        } else {
+            Some(profile.app.clone())
+        };
+        self.config.last_resolution = if profile.resolution.is_empty() {
+            None
+        } else {
+            Some(profile.resolution.clone())
+        };
+        self.config.last_app_label = if profile.app_label.is_empty() {
+            None
+        } else {
+            Some(profile.app_label.clone())
+        };
+        self.config.window_width = self.win_w_input.trim().parse().unwrap_or(0);
+        self.config.window_height = self.win_h_input.trim().parse().unwrap_or(0);
         self.config.last_serial = Some(serial);
         self.config.save();
     }
@@ -905,6 +1155,7 @@ impl GScrcpyApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Devices(devs) => self.apply_devices(devs),
+                Msg::DevicesTick => self.refresh_once(),
                 Msg::Packages(serial, apps, user_pkgs) => {
                     if self.selected_serial.as_deref() == Some(serial.as_str()) {
                         self.apps = apps;
@@ -915,22 +1166,12 @@ impl GScrcpyApp {
                             })
                             .collect();
                         self.packages_loading = false;
-                        let n = self.clone_pkgs.len();
-                        self.log(format!(
-                            "已加载 {} 个应用（含 {} 个分身应用）",
-                            self.apps.len() + n,
-                            n
-                        ));
                     }
                 }
                 Msg::ScrcpyVersion(v) => self.scrcpy_version = v,
                 Msg::DeviceSize(serial, size) => {
                     if let Some(sz) = size {
                         self.device_sizes.insert(serial.clone(), sz);
-                        self.log(format!(
-                            "[设备] {serial} 物理分辨率 {0}x{1}",
-                            sz.0, sz.1
-                        ));
                     }
                 }
                 Msg::PairDone(r) => {
@@ -938,12 +1179,14 @@ impl GScrcpyApp {
                     match r {
                         Ok(s) => {
                             self.pairing_status = s.clone();
-                            self.log(s);
                             self.refresh_once();
                         }
                         Err(e) => {
                             self.pairing_status = e.clone();
-                            self.log(e);
+                            // 配对超时 → 二维码标记失效（变灰、点击重新生成）
+                            if e.contains("超时") {
+                                self.qr_expired = true;
+                            }
                         }
                     }
                 }
@@ -965,7 +1208,6 @@ impl GScrcpyApp {
                         }
                         Err(e) => {
                             self.update_status = e.clone();
-                            self.log(e);
                         }
                     }
                 }
@@ -980,85 +1222,28 @@ impl GScrcpyApp {
                             self.ensure_refresh();
                             self.ensure_version_check();
                             self.update_status = "安装完成".into();
-                            self.log("scrcpy 安装/更新完成");
                         }
                         Err(e) => {
                             self.update_status = format!("更新失败: {e}");
-                            self.log(e);
                         }
                     }
                 }
-                Msg::Log(s) => self.log(s),
+                Msg::Log(_s) => {}
             }
         }
     }
 
     // ---------- UI ----------
 
-    /// 右侧「启动 scrcpy」面板内的版本/更新信息：scrcpy/adb 版本、检查更新、更新状态与最近日志
-    fn ui_bottom_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "scrcpy: {}",
-                    self.scrcpy_version
-                        .as_deref()
-                        .and_then(|v| v.split_whitespace().nth(1))
-                        .unwrap_or("未知")
-                ))
-                .small(),
-            );
-            if ui.button("检查更新").clicked() {
-                self.check_update();
-            }
-            if self.update_working {
-                ui.spinner();
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "adb: {}",
-                    self.adb_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "未找到".into())
-                ))
-                .small(),
-            );
-        });
-        if !self.update_status.is_empty() {
-            ui.label(egui::RichText::new(&self.update_status).small());
-        }
-        if let Some(Ok(info)) = &self.latest {
-            let cur = self
-                .scrcpy_version
-                .as_deref()
-                .and_then(|v| v.split_whitespace().nth(1))
-                .unwrap_or("?");
-            if updater::version_cmp(cur, &info.tag) == std::cmp::Ordering::Less {
-                if ui.button(format!("下载并更新到 {}", info.tag)).clicked() {
-                    self.install_latest();
-                }
-            }
-        }
-        if let Some(last) = self.logs.last() {
-            ui.label(egui::RichText::new(format!("日志: {last}")).small().weak());
-        }
-    }
-
-    fn ui_devices(&mut self, ui: &mut egui::Ui) {
+    /// 左栏：设备列表 + 选中设备操作 + scrcpy 更新区 + 二维码配对区
+    fn ui_left(&mut self, ui: &mut egui::Ui) {
         ui.heading("设备");
         if self.adb_path.is_none() {
             ui.colored_label(
                 egui::Color32::from_rgb(255, 120, 120),
                 "未找到 adb / scrcpy",
             );
-            ui.label("点击下方按钮下载 scrcpy（内含 adb）：");
-            if ui
-                .button("下载并安装 scrcpy（含 adb）")
-                .clicked()
-            {
+            if ui.button("下载并安装 scrcpy（含 adb）").clicked() {
                 self.install_latest();
             }
             if !self.update_status.is_empty() {
@@ -1074,13 +1259,6 @@ impl GScrcpyApp {
             ui.label(format!("自动刷新 · 共 {} 台", self.devices.len()));
         });
         if ui
-            .checkbox(&mut self.config.restore_gesture, "连接后自动重置手势导航")
-            .on_hover_text("修复部分机型（如华为）无线调试连接后侧滑/从底部滑动失效；每台设备连接时自动执行一次")
-            .changed()
-        {
-            self.config.save();
-        }
-        if ui
             .checkbox(&mut self.config.hide_ip_devices, "屏蔽 IP 格式设备（同手机只显示串号）")
             .on_hover_text("同一手机在 adb 里会同时出现 mDNS 串号与 ip:port 两个条目，默认只显示串号；没有对应串号的纯 IP 设备放进下方折叠区。取消勾选后全部显示。")
             .changed()
@@ -1090,7 +1268,6 @@ impl GScrcpyApp {
         }
 
         let mut to_select: Option<String> = None;
-        // 主列表过滤掉模拟器、本机回环、IP 格式设备（默认屏蔽），被过滤的单独展示在折叠区
         let (main_devs, filtered_devs): (Vec<&DeviceInfo>, Vec<&DeviceInfo>) = self
             .devices
             .iter()
@@ -1118,12 +1295,9 @@ impl GScrcpyApp {
         if let Some(serial) = to_select {
             if self.selected_serial.as_deref() != Some(serial.as_str()) {
                 self.selected_serial = Some(serial.clone());
-                self.config.last_serial = Some(serial);
+                self.config.last_serial = Some(serial.clone());
                 self.config.save();
-                self.apps.clear();
-                self.clone_pkgs.clear();
-                self.selected_app_user = None;
-                self.load_packages();
+                self.init_device_state(&serial);
             }
         }
 
@@ -1147,33 +1321,14 @@ impl GScrcpyApp {
                 if ui.button("断开").clicked() {
                     self.action_disconnect(&serial);
                 }
-                let repair_btn = ui.add_enabled(
-                    is_device,
-                    egui::Button::new("修复手机手势"),
-                );
-                if repair_btn
-                    .on_hover_text("荣耀/华为设备用虚拟显示器投屏后，若手机本机手势失效（底部上滑/右侧滑动无效），点击此按钮：自动用设备物理分辨率创建一次虚拟显示器再移除，手势热区即恢复为物理尺寸，无需重启手机。")
-                    .clicked()
-                {
-                    self.action_repair_gesture(&serial);
-                }
                 if ui.button("复制串号").clicked() {
                     self.copy_text(&serial);
                 }
             });
-            if !self.action_status.is_empty() {
-                let color = if self.action_error {
-                    egui::Color32::from_rgb(255, 110, 110)
-                } else {
-                    egui::Color32::from_rgb(150, 190, 255)
-                };
-                ui.colored_label(color, &self.action_status);
-            }
             ui.horizontal(|ui| {
                 ui.label("重命名:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.rename_input)
-                        .hint_text("输入设备别名"),
+                    egui::TextEdit::singleline(&mut self.rename_input).hint_text("输入设备别名"),
                 );
                 if ui.button("保存").clicked() {
                     self.save_rename(&serial);
@@ -1181,8 +1336,35 @@ impl GScrcpyApp {
             });
         }
 
+        // 二维码配对区（收窄：只二维码 + 重新生成；说明/密码进"？"帮助）
         ui.separator();
-        ui.heading("无线调试配对");
+        ui.horizontal(|ui| {
+            ui.heading("无线调试配对");
+            let help = "二维码：与手机「开发者选项 → 无线调试 → 使用二维码配对设备」配合使用。\n\
+                扫码后手机广播自己的配对服务，PC 会自动 adb pair 并连接，2 分钟内有效。\n\
+                若二维码失效/失败，可用下方「配对码方式」手动配对（手机页面会显示 ip:port 与 6 位配对码）。";
+            if ui
+                .add(egui::Button::new("？").corner_radius(8.0))
+                .on_hover_text(help)
+                .clicked()
+            {
+                // 点击 "？" 展开帮助
+                self.qr_help_open = !self.qr_help_open;
+            }
+        });
+        if self.qr_help_open {
+            ui.label(egui::RichText::new("二维码：与手机「开发者选项 → 无线调试 → 使用二维码配对设备」配合使用。扫码后手机广播配对服务，PC 自动 adb pair 并连接，2 分钟内有效。若失败可用配对码方式手动配对。").small().weak());
+            if !self.pairing_status.is_empty() {
+                ui.colored_label(
+                    if self.qr_expired {
+                        egui::Color32::from_rgb(255, 170, 90)
+                    } else {
+                        egui::Color32::from_rgb(150, 190, 255)
+                    },
+                    &self.pairing_status,
+                );
+            }
+        }
         if self.qr.is_none() {
             ui.label("二维码未生成（未找到 adb 或生成失败）");
             if ui.button("生成配对二维码").clicked() {
@@ -1198,24 +1380,73 @@ impl GScrcpyApp {
                     let ctx = ui.ctx().clone();
                     self.start_pairing(&ctx);
                 }
+                if let Some(qr) = &self.qr {
+                    // 密码进 "？" 帮助
+                    ui.label(
+                        egui::RichText::new(format!("配对密码 {}", qr.password))
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text("此密码仅用于手动配对，扫码时无需输入");
+                }
             });
             if let Some(tex) = &self.qr_texture {
-                ui.add(egui::Image::new((tex.id(), egui::vec2(230.0, 230.0))));
-            }
-            if let Some(qr) = &self.qr {
-                ui.monospace(format!("配对密码: {}", qr.password));
-            }
-            if !self.pairing_status.is_empty() {
-                ui.label(&self.pairing_status);
+                let size = egui::vec2(180.0, 180.0);
+                if self.qr_expired {
+                    // 失效效果：二维码整体变灰 + 半透明遮罩 + 中央「点击刷新」，
+                    // 点击二维码即重新生成（同支付二维码失效样式）
+                    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    let painter = ui.painter();
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    painter.image(tex.id(), rect, uv, egui::Color32::from_gray(70));
+                    painter.rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(15, 15, 20, 160),
+                    );
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "二维码已失效\n点击刷新",
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    );
+                    if resp.clicked() {
+                        self.qr = None;
+                        self.qr_texture = None;
+                        self.qr_expired = false;
+                        self.pairing_status.clear();
+                        let ctx = ui.ctx().clone();
+                        self.start_pairing(&ctx);
+                    }
+                } else {
+                    ui.add(egui::Image::new((tex.id(), size)));
+                }
             }
         }
 
         ui.separator();
-        ui.label("手动连接（已配对过可直接输入）:");
+        ui.label("配对码方式（二维码失败时用）:");
         ui.horizontal(|ui| {
             ui.add(
-                egui::TextEdit::singleline(&mut self.manual_ip)
-                    .hint_text("如 192.168.1.5:37855"),
+                egui::TextEdit::singleline(&mut self.pair_code_ip)
+                    .hint_text("手机无线调试页 ip:port")
+                    .desired_width(130.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pair_code)
+                    .hint_text("6 位配对码")
+                    .desired_width(80.0),
+            );
+        });
+        if ui.button("配对并连接").clicked() {
+            self.action_pair_with_code();
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("手动连接:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.manual_ip).hint_text("如 192.168.1.5:37855"),
             );
             if ui.button("连接").clicked() {
                 let hp = self.manual_ip.trim().to_string();
@@ -1238,406 +1469,528 @@ impl GScrcpyApp {
             }
         });
 
+        // scrcpy 更新区（连接下方）
         ui.separator();
-        ui.label("配对码方式（二维码失败时用）:");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.pair_code_ip)
-                    .hint_text("手机无线调试页的 ip:port，如 192.168.1.5:43129"),
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "scrcpy: {}",
+                    self.scrcpy_version
+                        .as_deref()
+                        .and_then(|v| v.split_whitespace().nth(1))
+                        .unwrap_or("未知")
+                ))
+                .small(),
             );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.pair_code)
-                    .hint_text("6 位配对码")
-                    .desired_width(90.0),
-            );
-            if ui.button("配对并连接").clicked() {
-                self.action_pair_with_code();
+            if ui.button("检查更新").clicked() {
+                self.check_update();
+            }
+            if self.update_working {
+                ui.spinner();
             }
         });
-
-        egui::CollapsingHeader::new("配对过程日志（排障用）")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "二维码配对每步都会记录真实输出/错误；若仍未配对成功，把这里的内容发给我即可定位问题。",
-                    )
-                    .small()
-                    .weak(),
-                );
-                egui::ScrollArea::vertical()
-                    .max_height(200.0)
-                    .show(ui, |ui| {
-                        for l in self.logs.iter().rev().take(80) {
-                            ui.label(egui::RichText::new(l).small());
-                        }
-                    });
-            });
-    }
-
-    fn ui_launch(&mut self, ui: &mut egui::Ui) {
-        ui.heading("启动 scrcpy");
-        self.ui_bottom_bar(ui);
-        ui.separator();
-        let serial = self.selected_serial.clone();
-        if let Some(s) = &serial {
-            ui.label(format!("设备: {}", self.device_display(s)));
-        } else {
-            ui.colored_label(egui::Color32::from_rgb(255, 160, 80), "请先在左侧选择设备");
+        if !self.update_status.is_empty() {
+            ui.label(egui::RichText::new(&self.update_status).small());
+        }
+        if let Some(Ok(info)) = &self.latest {
+            let cur = self
+                .scrcpy_version
+                .as_deref()
+                .and_then(|v| v.split_whitespace().nth(1))
+                .unwrap_or("?");
+            if updater::version_cmp(cur, &info.tag) == std::cmp::Ordering::Less {
+                if ui.button(format!("下载并更新到 {}", info.tag)).clicked() {
+                    self.install_latest();
+                }
+            }
         }
 
-        ui.horizontal(|ui| {
-            ui.label("应用类名(包名):");
-            let sel_user = self.selected_app_user;
-            egui::ComboBox::from_id_salt("app_history")
-                .selected_text(if self.app_input.is_empty() {
-                    "历史记录…".to_string()
-                } else {
-                    self.app_input.clone()
-                })
-                .width(220.0)
-                .show_ui(ui, |ui| {
-                    if self.config.app_history.is_empty() {
-                        ui.label("（暂无历史）");
-                    }
-                    for item in self.config.app_history.clone() {
-                        if ui.selectable_label(self.app_input == item, &item).clicked() {
-                            self.app_input = item;
-                            self.selected_app_user = None;
-                        }
-                    }
-                });
-            let app_resp = ui.add(
-                egui::TextEdit::singleline(&mut self.app_input)
-                    .hint_text("如 com.gof.china")
-                    .desired_width(260.0),
-            );
-            if app_resp.changed() {
-                // 手动输入/修改时视为机主应用
-                self.selected_app_user = None;
-            }
-            if let Some(uid) = sel_user {
-                ui.label(
-                    egui::RichText::new(format!("分身 user {uid}"))
-                        .small()
-                        .color(egui::Color32::from_rgb(255, 190, 90)),
+    }
+
+    /// 中栏：当前设备的 profile 列表（增/删/改/直接改名）
+    fn ui_profiles(&mut self, ui: &mut egui::Ui) {
+        let Some(serial) = self.selected_serial.clone() else {
+            ui.heading("配置（Profile）");
+            ui.label("请先在左侧选择设备");
+            return;
+        };
+        ui.heading("配置（Profile）");
+        ui.label(egui::RichText::new(format!("设备: {}", self.device_display(&serial))).small());
+        if ui.button("＋ 新建配置").clicked() {
+            self.add_profile(&serial);
+        }
+        ui.separator();
+        let active_name = self
+            .config
+            .active_profile
+            .as_ref()
+            .filter(|(s, _)| s == &serial)
+            .map(|(_, n)| n.clone());
+        let mut to_rename: Option<(String, String)> = None;
+        let mut to_delete: Option<String> = None;
+        let mut to_select: Option<String> = None;
+        // 重命名输入区（常驻控件：输入框每帧渲染、文本存字段，避免临时控件输入不同步；
+        // 点击「改名」后自动聚焦，直接输入新名字）
+        if let Some(rename_target) = self.renaming_profile.clone() {
+            ui.horizontal(|ui| {
+                ui.label("重命名:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.renaming_name)
+                        .desired_width(150.0),
                 );
+                if self.rename_focus_requested {
+                    resp.request_focus();
+                    self.rename_focus_requested = false;
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let new_name = self.renaming_name.trim().to_string();
+                    if !new_name.is_empty() {
+                        to_rename = Some((rename_target.clone(), new_name));
+                    }
+                    self.renaming_profile = None;
+                }
+                if ui
+                    .button(egui::RichText::new("✔").small())
+                    .on_hover_text("保存新名字")
+                    .clicked()
+                {
+                    let new_name = self.renaming_name.trim().to_string();
+                    if !new_name.is_empty() {
+                        to_rename = Some((rename_target.clone(), new_name));
+                    }
+                    self.renaming_profile = None;
+                }
+                if ui
+                    .button(egui::RichText::new("×").small())
+                    .on_hover_text("取消改名")
+                    .clicked()
+                {
+                    self.renaming_profile = None;
+                }
+            });
+            ui.separator();
+        }
+        let names: Vec<String> = self.profiles.iter().map(|p| p.name.clone()).collect();
+        for name in names {
+            let is_active = active_name.as_deref() == Some(name.as_str());
+            ui.horizontal(|ui| {
+                // 只读态：点名字=选中该配置；点「改名」进入顶部常驻重命名输入区
+                if ui
+                    .selectable_label(is_active, &name)
+                    .on_hover_text("点击选中此配置")
+                    .clicked()
+                {
+                    to_select = Some(name.clone());
+                }
+                let action = ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let mut a = None;
+                        if ui
+                            .button(egui::RichText::new("×").small())
+                            .on_hover_text("删除此配置")
+                            .clicked()
+                        {
+                            a = Some(0);
+                        }
+                        if ui
+                            .button(egui::RichText::new("改名").small())
+                            .on_hover_text("重命名此配置")
+                            .clicked()
+                        {
+                            a = Some(1);
+                        }
+                        a
+                    },
+                );
+                match action.inner {
+                    Some(1) => {
+                        self.renaming_profile = Some(name.clone());
+                        self.renaming_name = name.clone();
+                        self.rename_focus_requested = true;
+                    }
+                    Some(0) => to_delete = Some(name.clone()),
+                    _ => {}
+                }
+            });
+        }
+        if let Some((old, new)) = to_rename {
+            self.rename_profile(&serial, &old, &new);
+        }
+        if let Some(name) = to_delete {
+            self.delete_profile(&serial, &name);
+        }
+        if let Some(name) = to_select {
+            self.config.active_profile = Some((serial.clone(), name.clone()));
+            self.config.save();
+            self.sync_profiles(&serial);
+        }
+        if self.profiles.is_empty() {
+            ui.label(egui::RichText::new("（暂无配置，点「＋ 新建配置」创建）").weak().small());
+        }
+    }
+
+    /// 右栏：profile 编辑器
+    fn ui_profile_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(serial) = self.selected_serial.clone() else {
+            ui.heading("启动");
+            ui.label("请先在左侧选择设备");
+            return;
+        };
+        let Some(mut edit) = self.profile_edit.clone() else {
+            ui.heading("启动");
+            ui.label("请先在中栏选择或新建配置");
+            return;
+        };
+        ui.heading("启动");
+        ui.label(egui::RichText::new(format!("配置: {}", edit.name)).small().weak());
+
+        // 两个启动按钮
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let btn1 = ui.add_enabled(
+                !edit.app.trim().is_empty(),
+                egui::Button::new(
+                    egui::RichText::new("启动 app").size(16.0).strong(),
+                )
+                .min_size(egui::vec2(110.0, 34.0)),
+            );
+            if btn1.on_hover_text("按此配置启动应用（分身/虚拟显示器逻辑按配置执行）").clicked() {
+                self.launch_profile_app();
+            }
+            let btn2 = ui.add(
+                egui::Button::new(
+                    egui::RichText::new("映射屏幕").size(16.0).strong(),
+                )
+                .min_size(egui::vec2(110.0, 34.0)),
+            );
+            if btn2.on_hover_text("不启动应用，直接投屏当前设备（分辨率按本配置，留空=直接镜像）").clicked() {
+                self.launch_mirror_screen();
             }
         });
+        ui.add_space(4.0);
+        ui.separator();
+
+        // 应用选择：egui 标准下拉框（ComboBox，自绘箭头/弹层，无字体缺失问题）
+        // selected_text 显示应用名字（与选项一致）；菜单内顶部可输入过滤，机主/分身分区
+        ui.label("应用:");
+        let mut edit_app = edit.app.clone();
+        let mut edit_label = edit.app_label.clone();
+        let mut edit_clone = edit.clone_user;
+        let mut apply_from_list: Option<(String, Option<i32>, String)> = None;
+        let selected_text = if edit.app.is_empty() {
+            "选择应用…".to_string()
+        } else {
+            // 显示「名字 包名」；分身追加（分身）标记
+            let base = if edit.app_label.is_empty() {
+                edit.app.clone()
+            } else {
+                format!("{}  {}", edit.app_label, edit.app)
+            };
+            if edit.clone_user.is_some() {
+                format!("{}（分身）", base)
+            } else {
+                base
+            }
+        };
+        // 应用下拉：自建标准下拉框（Button 显示选中项 + 右侧三角，点击弹层）
+        // 弹层内顶部过滤输入框（输入即过滤，点击不会关闭弹层）+ 机主/分身分区；
+        // 点击弹层外部或选中选项自动关闭
+        let popup_id = ui.make_persistent_id("app_picker_area");
+        let resp = ui.add(
+            egui::Button::new(egui::RichText::new(selected_text).monospace())
+                .min_size(egui::vec2(300.0, 24.0)),
+        );
+        // 右侧自绘下拉三角（无字形缺失问题）
+        if ui.is_rect_visible(resp.rect) {
+            let painter = ui.painter_at(resp.rect);
+            let c = egui::pos2(resp.rect.right() - 10.0, resp.rect.center().y);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x - 3.5, c.y - 1.5),
+                    egui::pos2(c.x + 3.5, c.y - 1.5),
+                    egui::pos2(c.x, c.y + 2.5),
+                ],
+                ui.visuals().text_color(),
+                egui::Stroke::NONE,
+            ));
+        }
+        if resp.clicked() {
+            self.app_combo_open = !self.app_combo_open;
+        }
+        let mut picked_out: Option<(String, Option<i32>, String)> = None;
+        if self.app_combo_open {
+            let area = egui::Area::new(popup_id)
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(resp.rect.left(), resp.rect.bottom() + 2.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(300.0);
+                        // 菜单内过滤输入框（输入即过滤，点击不会关闭弹层）
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("过滤:").small());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.app_input)
+                                    .hint_text("输入包名或应用名过滤")
+                                    .desired_width(230.0),
+                            );
+                        });
+                        ui.separator();
+                        let filter = self.app_input.to_lowercase();
+                        let picked = egui::ScrollArea::vertical()
+                            .id_salt("app_picker_scroll")
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                        let mut picked = None;
+                        // 机主应用（独立计数，避免顶掉分身分区）
+                        let mut shown_main = 0;
+                        for app in self.apps.iter().filter(|a| {
+                            filter.is_empty()
+                                || a.package.to_lowercase().contains(&filter)
+                                || a.name.to_lowercase().contains(&filter)
+                        }) {
+                            if shown_main >= 60 {
+                                ui.label(
+                                    egui::RichText::new("…（继续输入过滤词缩小范围）")
+                                        .weak()
+                                        .small(),
+                                );
+                                break;
+                            }
+                            let text = if app.name.is_empty() {
+                                app.package.clone()
+                            } else {
+                                format!("{}  {}", app.name, app.package)
+                            };
+                            let is_sel = edit_app == app.package && edit_clone.is_none();
+                            if ui.selectable_label(is_sel, text).clicked() {
+                                picked = Some((app.package.clone(), None, app.name.clone()));
+                            }
+                            shown_main += 1;
+                        }
+                        // 分身分区（独立计数）
+                        let mut shown_clone = 0;
+                        let mut has_clone = false;
+                        for (uid, uname, app) in self.clone_pkgs.iter().filter(|(_, _, a)| {
+                            filter.is_empty()
+                                || a.package.to_lowercase().contains(&filter)
+                                || a.name.to_lowercase().contains(&filter)
+                        }) {
+                            if !has_clone {
+                                ui.separator();
+                                ui.label(egui::RichText::new("— 分身应用 —").weak().small());
+                                has_clone = true;
+                            }
+                            if shown_clone >= 60 {
+                                ui.label(
+                                    egui::RichText::new("…（分身列表过多，继续输入过滤）")
+                                        .weak()
+                                        .small(),
+                                );
+                                break;
+                            }
+                            // 分身实例名已含「分身」时不再加前缀（[分身 分身应用] -> [分身应用]）
+                            let clone_tag = if uname.contains("分身") {
+                                format!("[{uname}]")
+                            } else {
+                                format!("[分身 {uname}]")
+                            };
+                            let text = if app.name.is_empty() {
+                                format!("{}  {}", app.package, clone_tag)
+                            } else {
+                                format!("{}  {}  {}", app.name, app.package, clone_tag)
+                            };
+                            let is_sel = edit_app == app.package && edit_clone == Some(*uid);
+                            if ui.selectable_label(is_sel, text).clicked() {
+                                picked =
+                                    Some((app.package.clone(), Some(*uid), app.name.clone()));
+                            }
+                            shown_clone += 1;
+                        }
+                        if self.apps.is_empty()
+                            && self.clone_pkgs.is_empty()
+                            && !self.packages_loading
+                        {
+                            ui.label(
+                                egui::RichText::new(
+                                    "应用列表为空（加载失败或设备未连接），点下方「刷新应用列表」重试",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        }
+                        picked
+                            })
+                            .inner;
+                        (picked, ui.min_rect())
+                    })
+                    .inner
+                });
+            // 点击弹层外部关闭：以「按下位置」是否落在弹层内容矩形内判定，
+            // 点过滤框/列表（弹层内）不会关闭；排除打开当帧的按钮点击（否则一打开就被关掉）
+            if ui.input(|i| i.pointer.any_pressed()) {
+                let origin = ui.input(|i| i.pointer.press_origin());
+                let inside = origin.map_or(false, |p| area.inner.1.contains(p));
+                if !inside && !resp.clicked() {
+                    self.app_combo_open = false;
+                }
+            }
+            picked_out = area.inner.0;
+        }
+        if let Some((pkg, uid, name)) = picked_out {
+            apply_from_list = Some((pkg, uid, name));
+            self.app_combo_open = false;
+        }
+        if let Some((pkg, uid, name)) = apply_from_list {
+            edit_app = pkg;
+            edit_clone = uid;
+            // 选中新应用时默认填应用显示名（可修改）
+            edit_label = name;
+            // 清空过滤词，下次打开菜单显示完整列表
+            self.app_input.clear();
+        }
+        if self.packages_loading {
+            ui.spinner();
+        }
+        if ui.button("刷新应用列表").clicked() {
+            self.load_packages();
+        }
+
+        ui.separator();
+        ui.label("窗口标题（默认应用名称，可修改）:");
+        ui.add(
+            egui::TextEdit::singleline(&mut edit_label)
+                .hint_text("如 无尽冬日")
+                .desired_width(300.0),
+        );
+
+        ui.separator();
+        ui.label("分辨率（留空 = 直接镜像物理屏幕）:");
+        let mut edit_res = edit.resolution.clone();
         ui.horizontal(|ui| {
-            ui.label("显示名(可选):");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.app_label_input)
-                    .hint_text("用于窗口标题，如 王者荣耀")
-                    .desired_width(260.0),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("分辨率:");
             egui::ComboBox::from_id_salt("res_history")
-                .selected_text(if self.resolution_input.is_empty() {
-                    "直接镜像物理屏幕".to_string()
+                .selected_text(if edit_res.is_empty() {
+                    "留空 = 直接镜像物理屏幕".to_string()
                 } else {
-                    self.resolution_input.clone()
+                    edit_res.clone()
                 })
                 .width(170.0)
                 .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(self.resolution_input.is_empty(), "直接镜像物理屏幕")
-                        .clicked()
-                    {
-                        self.resolution_input.clear();
-                    }
+                    // 历史分辨率列表（留空 = 直接镜像，通过清空输入框实现）
                     for item in self.config.resolutions.clone() {
                         if ui
-                            .selectable_label(self.resolution_input == item, &item)
+                            .selectable_label(edit_res == item, &item)
                             .clicked()
                         {
-                            self.resolution_input = item;
+                            edit_res = item;
                         }
                     }
                 });
             ui.add(
-                egui::TextEdit::singleline(&mut self.resolution_input)
+                egui::TextEdit::singleline(&mut edit_res)
                     .hint_text("留空=直接镜像")
-                    .desired_width(110.0),
+                    .desired_width(100.0),
             );
-            let size = self
-                .selected_serial
-                .clone()
-                .and_then(|s| self.device_sizes.get(&s).copied());
-            if let Some((w, h)) = size {
-                if ui
-                    .button(format!("用设备分辨率 {w}x{h}"))
-                    .on_hover_text("把虚拟分辨率设为设备物理分辨率，避免比例不一致导致 app 只占画面一部分")
-                    .clicked()
-                {
-                    self.resolution_input = format!("{w}x{h}");
-                }
-            }
-            ui.label("窗口:");
+        });
+        ui.label("窗口尺寸（留空 = 与分辨率相同）:");
+        ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.win_w_input)
                     .desired_width(60.0)
-                    .hint_text("留空=自动"),
+                    .hint_text("宽"),
             );
             ui.label("x");
             ui.add(
                 egui::TextEdit::singleline(&mut self.win_h_input)
                     .desired_width(60.0)
-                    .hint_text("留空=自动"),
+                    .hint_text("高"),
             );
         });
-        ui.label(
-            egui::RichText::new(
-                "提示：分辨率/窗口留空 = 直接镜像物理屏幕、窗口自动匹配比例，不会出现 app 只占画面一部分的情况。",
-            )
-            .small()
-            .weak(),
-        );
 
-        let title_preview = match &serial {
-            Some(s) => {
-                let pkg = self.app_input.trim().to_string();
-                let label = self.app_label_input.trim().to_string();
-                let name = if label.is_empty() { pkg.as_str() } else { label.as_str() };
-                if name.is_empty() {
-                    "窗口标题: （类名为空）".to_string()
-                } else {
-                    format!("窗口标题: {name} - {}", self.device_display(s))
-                }
-            }
-            None => "窗口标题: （未选设备）".to_string(),
-        };
-        ui.label(title_preview);
-        // 分身投屏模式选择 + 快捷键提示（仅分身场景显示）
-        if self.selected_app_user.is_some() {
-            ui.horizontal(|ui| {
-                if ui
-                    .checkbox(
-                        &mut self.config.clone_direct_mirror,
-                        "分身直接镜像手机屏幕（不建虚拟显示器）",
-                    )
-                    .on_hover_text("虚拟显示器模式：分身显示在 scrcpy 窗口，手机屏幕不被占用，但 Android 系统手势（边缘返回/上滑）不可用（平台限制，scrcpy/escrcpy 相同），可用鼠标右键=返回、Alt/Super+H=桌面、Alt/Super+S=最近任务代替。直接镜像模式：分身应用在手机前台启动并镜像，系统手势可用，但手机屏幕会被应用占用。")
-                    .changed()
-                {
-                    self.config.save();
-                }
-            });
-            if !self.config.clone_direct_mirror {
-                ui.label(
-                    egui::RichText::new(
-                        "虚拟显示器模式：系统手势（边缘返回/上滑）不可用——鼠标右键=返回，Alt/Super+H=桌面，Alt/Super+S=最近任务",
-                    )
-                    .small()
-                    .weak(),
-                );
-            }
+        // 应用/标题/分辨率变更 → 写回编辑副本并保存（分身投屏固定为虚拟显示器模式，
+        // 手势热区固定为 Auto，投屏结束后由后台线程自动物理化修复，均无需界面配置）
+
+        // 投屏结束后由后台线程自动物理化修复，不再需要界面配置）
+        let mut changed = false;
+        if edit_app != edit.app {
+            edit.app = edit_app;
+            changed = true;
         }
-
-        if ui
-            .add_enabled(serial.is_some(), egui::Button::new("打开 scrcpy"))
-            .clicked()
+        if edit_clone != edit.clone_user {
+            edit.clone_user = edit_clone;
+            changed = true;
+        }
+        if edit_label != edit.app_label {
+            edit.app_label = edit_label;
+            changed = true;
+        }
+        if edit_res != edit.resolution {
+            edit.resolution = edit_res;
+            changed = true;
+        }
+        if changed {
+            self.profile_edit = Some(edit.clone());
+            self.save_profile_edit(&serial);
+            self.sync_profiles(&serial);
+        }
+        if self.win_w_input.trim().parse::<u32>().is_ok()
+            || self.win_h_input.trim().parse::<u32>().is_ok()
         {
-            self.launch_scrcpy();
+            let _ = self.win_w_input.clone();
         }
-
-        egui::CollapsingHeader::new("查看生成的命令")
-            .default_open(false)
-            .show(ui, |ui| {
-                if let Some(s) = &serial {
-                    let pkg = self.app_input.trim().to_string();
-                    let res = self.resolution_input.trim().to_string();
-                    let ww = self.win_w_input.parse::<u32>().unwrap_or(0);
-                    let wh = self.win_h_input.parse::<u32>().unwrap_or(0);
-                    let label = self.app_label_input.trim().to_string();
-                    let name = if label.is_empty() { pkg.as_str() } else { label.as_str() };
-                    let title = format!("{name} - {}", self.device_display(s));
-                    let clone_user = self.selected_app_user;
-                    if let Some(uid) = clone_user {
-                        ui.monospace(format!(
-                            "adb -s {s} shell cmd package resolve-activity --brief --components --user {uid} {pkg}  # 解析 Activity（分身必须 --components）"
-                        ));
-                        if let Some(scrcpy) = self.scrcpy() {
-                            let args = scrcpy.build_clone_args(s, &res, ww, wh, &title);
-                            ui.monospace(format!("scrcpy {}", args.join(" ")));
-                        }
-                        // 分身投屏命令：displayId 来自 scrcpy 输出（每次启动动态变化）；
-                        // 若已成功解析过同包名 Activity，直接显示真实组件
-                        let cached = self
-                            .last_resolved_component
-                            .as_ref()
-                            .filter(|(u, p, _)| *u == uid && p == &pkg)
-                            .map(|(_, _, c)| c.clone());
-                        match cached {
-                            Some(c) => ui.monospace(format!(
-                                "adb -s {s} shell am start-activity --user {uid} --display <scrcpy输出的ID> -n {c}"
-                            )),
-                            None => ui.monospace(format!(
-                                "adb -s {s} shell am start-activity --user {uid} --display <scrcpy输出的ID> -n <{pkg}的Activity>  # 点击「打开 scrcpy」后自动解析"
-                            )),
-                        };
-                    } else if let Some(scrcpy) = self.scrcpy() {
-                        let args = scrcpy.build_args(s, Some(&pkg), &res, ww, wh, &title);
-                        ui.monospace(format!("scrcpy {}", args.join(" ")));
-                    }
-                }
-            });
-
-        ui.separator();
-        ui.heading(format!("应用列表（点击复制并填入）"));
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.package_filter)
-                    .hint_text("过滤…")
-                    .desired_width(200.0),
-            );
-            if ui.button("刷新应用列表").clicked() {
-                self.load_packages();
-            }
-            if self.packages_loading {
-                ui.spinner();
-            }
-        });
-        let filter = self.package_filter.to_lowercase();
-        let filtered: Vec<AppInfo> = self
-            .apps
-            .iter()
-            .filter(|a| {
-                filter.is_empty()
-                    || a.package.to_lowercase().contains(&filter)
-                    || a.name.to_lowercase().contains(&filter)
-            })
-            .cloned()
-            .collect();
-        ui.label(format!("共 {} 个（可搜应用名或包名）", filtered.len()));
-        egui::ScrollArea::vertical()
-            .max_height(360.0)
-            .show(ui, |ui| {
-                for app in filtered {
-                    let is_sel =
-                        self.app_input == app.package && self.selected_app_user.is_none();
-                    let text = if app.name.is_empty() {
-                        app.package.clone()
-                    } else {
-                        format!("{}  {}", app.name, app.package)
-                    };
-                    if ui.selectable_label(is_sel, text).clicked() {
-                        self.copy_text(&app.package);
-                        self.app_input = app.package.clone();
-                        self.selected_app_user = None;
-                        // 手机端显示名自动填入「显示名」，无需手动填写
-                        if !app.name.is_empty() {
-                            self.app_label_input = app.name.clone();
-                            self.config
-                                .app_labels
-                                .insert(app.package.clone(), app.name.clone());
-                            self.config.save();
-                        } else if self.app_label_input.is_empty() {
-                            self.app_label_input = app.package.clone();
-                        }
-                        self.log(format!(
-                            "已复制并填入: {}{}",
-                            app.name,
-                            if app.name.is_empty() {
-                                String::new()
-                            } else {
-                                format!("（{}）", app.package)
-                            }
-                        ));
-                    }
-                }
-                // 分身应用分区（华为 user 128 / 努比亚 user 999 等），按用户分组。
-                // 名字复用主用户(user 0)里同包名的显示名（与 escrcpy 一致）。
-                let clone_filtered: Vec<(i32, String, AppInfo)> = self
-                    .clone_pkgs
-                    .iter()
-                    .filter(|(_, _, a)| {
-                        filter.is_empty()
-                            || a.package.to_lowercase().contains(&filter)
-                            || a.name.to_lowercase().contains(&filter)
-                    })
-                    .cloned()
-                    .collect();
-                if !clone_filtered.is_empty() {
-                    ui.separator();
-                    egui::CollapsingHeader::new(format!(
-                        "分身应用（{} 个）",
-                        clone_filtered.len()
-                    ))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        let mut groups: Vec<(i32, String, Vec<AppInfo>)> = Vec::new();
-                        for (uid, uname, app) in clone_filtered {
-                            match groups.iter_mut().find(|(id, _, _)| *id == uid) {
-                                Some((_, _, ps)) => ps.push(app),
-                                None => groups.push((uid, uname, vec![app])),
-                            }
-                        }
-                        for (uid, uname, apps) in groups {
-                            ui.label(
-                                egui::RichText::new(format!("{uname}（user {uid}）"))
-                                    .strong()
-                                    .small(),
-                            );
-                            for app in apps {
-                                let is_sel =
-                                    self.app_input == app.package
-                                        && self.selected_app_user == Some(uid);
-                                let text = if app.name.is_empty() {
-                                    format!("{}  [分身 user {uid}]", app.package)
-                                } else {
-                                    format!("{}  {}  [分身 user {uid}]", app.name, app.package)
-                                };
-                                if ui.selectable_label(is_sel, text).clicked() {
-                                    self.copy_text(&app.package);
-                                    self.app_input = app.package.clone();
-                                    self.selected_app_user = Some(uid);
-                                    if !app.name.is_empty() {
-                                        self.app_label_input = app.name.clone();
-                                        self.config
-                                            .app_labels
-                                            .insert(app.package.clone(), app.name.clone());
-                                        self.config.save();
-                                    } else if self.app_label_input.is_empty() {
-                                        self.app_label_input = app.package.clone();
-                                    }
-                                    self.log(format!(
-                                        "已复制并填入分身: {}{} (user {uid})",
-                                        app.name,
-                                        if app.name.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!("（{}）", app.package)
-                                        }
-                                    ));
-                                }
-                            }
-                        }
-                    });
-                }
-            });
     }
 }
 
 impl eframe::App for GScrcpyApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(Duration::from_millis(300));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::left("left")
+        // 底部状态栏：操作/启动提示统一显示在这里（不再占用左栏）
+        egui::Panel::bottom("status_bar")
+            .resizable(false)
+            .default_size(26.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if !self.action_status.is_empty() {
+                        let color = if self.action_error {
+                            egui::Color32::from_rgb(255, 110, 110)
+                        } else {
+                            egui::Color32::from_rgb(150, 190, 255)
+                        };
+                        ui.colored_label(color, &self.action_status);
+                    }
+                    let selected_display = self
+                        .selected_serial
+                        .clone()
+                        .map(|s| self.device_display(&s));
+                    if let Some(d) = selected_display {
+                        ui.label(egui::RichText::new(format!("· 选中 {d}")).weak().small());
+                    }
+                });
+            });
+        // 三栏：左=设备，中=Profile 列表，右=Profile 编辑
+        egui::Panel::left("left_devices")
             .resizable(true)
-            .default_size(330.0)
+            .default_size(290.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.ui_devices(ui);
+                    self.ui_left(ui);
+                });
+            });
+        egui::Panel::left("middle_profiles")
+            .resizable(true)
+            .default_size(230.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.ui_profiles(ui);
                 });
             });
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                self.ui_launch(ui);
+                self.ui_profile_editor(ui);
             });
         });
     }
@@ -1652,8 +2005,44 @@ impl Drop for GScrcpyApp {
 
 // ---------- 工具函数 ----------
 
-/// 是否为 IP 格式串号（如 "192.168.1.5:37855"）：非 adb- 开头且形如 ip:port。
-/// mDNS 串号（adb-XXX._adb-tls-connect._tcp）与 USB/模拟器串号都不算。
+/// 是否为 IP 格式串号（如 "192.168.1.5:37855"）
+/// 本机常见模拟器 adb 端口（仅探测 127.0.0.1，不触碰局域网设备）
+const LOCAL_EMULATOR_PORTS: &[u16] = &[7555, 16384, 16385, 5555, 5554];
+
+/// 上次探测模拟器端口的时间（秒），5 秒冷却避免高频刷新时反复探测
+static LAST_EMU_PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 探测本机常见的模拟器 adb 端口并自动 `adb connect`（MuMu 7555/16384/16385、
+/// 通用 5555/5554 等）。打开模拟器后无需手动连接，设备列表刷新即可出现。
+fn try_connect_local_emulators(adb: &Adb) {
+    use std::sync::atomic::Ordering as AOrdering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(LAST_EMU_PROBE.load(AOrdering::Relaxed)) < 5 {
+        return;
+    }
+    LAST_EMU_PROBE.store(now, AOrdering::Relaxed);
+    let known: std::collections::HashSet<String> = adb
+        .devices()
+        .into_iter()
+        .map(|d| d.serial)
+        .collect();
+    for port in LOCAL_EMULATOR_PORTS {
+        let hp = format!("127.0.0.1:{port}");
+        if known.contains(&hp) {
+            continue;
+        }
+        // 快速 TCP 探测：端口开放才 connect（closed 端口 connect 会等很久）
+        let addr: std::net::SocketAddr = hp.parse().unwrap();
+        let ok = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok();
+        if ok {
+            let _ = adb.connect(&hp);
+        }
+    }
+}
+
 fn is_ip_serial(serial: &str) -> bool {
     if serial.starts_with("adb-") || serial.starts_with("emulator-") {
         return false;
@@ -1664,7 +2053,6 @@ fn is_ip_serial(serial: &str) -> bool {
     if host.is_empty() || port.is_empty() {
         return false;
     }
-    // 主机部分以数字开头（IPv4）或为 [IPv6]
     host.starts_with(|c: char| c.is_ascii_digit()) || host.starts_with('[')
 }
 
@@ -1676,17 +2064,15 @@ mod tests {
     fn ip_serial_predicate() {
         assert!(is_ip_serial("192.168.1.5:37855"));
         assert!(is_ip_serial("10.0.0.8:5555"));
-        assert!(is_ip_serial("127.0.0.1:7555")); // 回环也是 ip:port，是否隐藏由过滤逻辑处理
+        assert!(is_ip_serial("127.0.0.1:7555"));
         assert!(!is_ip_serial("emulator-5554"));
         assert!(!is_ip_serial("adb-D1222091020A-aWsoaY._adb-tls-connect._tcp"));
-        assert!(!is_ip_serial("127.0.0.1")); // 无端口不算
+        assert!(!is_ip_serial("127.0.0.1"));
         assert!(!is_ip_serial("f51065db"));
     }
 }
 
-/// 渲染一行设备并返回点击响应。
-/// 未选中：扁平文字行（offline 灰色、其余浅色，不使用绿色）；
-/// 选中：亮蓝底白字加粗，保证醒目。
+/// 渲染一行设备并返回点击响应
 fn render_device_row(
     ui: &mut egui::Ui,
     config: &Config,
@@ -1705,7 +2091,6 @@ fn render_device_row(
                 .corner_radius(4.0),
         )
     } else {
-        // 未选中/被过滤设备：浅蓝色（离线稍暗）
         let color = if dev.state == "offline" {
             egui::Color32::from_rgb(110, 145, 190)
         } else {
@@ -1715,9 +2100,7 @@ fn render_device_row(
     }
 }
 
-/// 加载系统中文字体作为回退字体。
-/// egui 内置字体不含 CJK 字形，中文会显示为方块，这里从 Windows 系统字体目录加载
-/// 微软雅黑等字体，追加到比例/等宽字体的回退链中。
+/// 加载系统中文字体作为回退字体
 fn setup_cjk_fonts(ctx: &egui::Context) {
     const CANDIDATES: [&str; 7] = [
         r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑
@@ -1748,7 +2131,6 @@ fn setup_cjk_fonts(ctx: &egui::Context) {
 }
 
 fn valid_resolution(s: &str) -> bool {
-    // 空串 = 直接镜像物理屏幕（合法）；否则必须是 宽x高
     if s.is_empty() {
         return true;
     }
