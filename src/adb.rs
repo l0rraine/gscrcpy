@@ -116,9 +116,78 @@ impl Adb {
             .collect()
     }
 
-    /// 解析包在指定用户下的启动 Activity（component，如 com.gof.china/.MainActivity）
-    pub fn resolve_activity(&self, serial: &str, user: i32, pkg: &str) -> Option<String> {
-        let u = format!("--user={user}");
+    /// 列出指定用户下的**三方应用**包（`pm list packages -3`，与 escrcpy 一致：
+    /// 分身用户里只展示用户自己装的第三方应用，过滤系统噪音）。
+    pub fn packages_third_party_for_user(&self, serial: &str, user: i32) -> Vec<String> {
+        let u = user.to_string();
+        let out = match self.run(&[
+            "-s",
+            serial,
+            "shell",
+            "pm",
+            "list",
+            "packages",
+            "-3",
+            "--user",
+            &u,
+        ]) {
+            Ok(o) => o,
+            Err(_) => return vec![],
+        };
+        out.lines()
+            .filter_map(|l| l.trim().strip_prefix("package:").map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// 列出指定用户下**有桌面启动入口**的包（`cmd package query-activities`，
+    /// 与 escrcpy 一致：只展示可启动的应用，过滤无 Activity 的服务/后台包）。
+    pub fn launchable_packages(&self, serial: &str, user: i32) -> Vec<String> {
+        let u = user.to_string();
+        let out = match self.run(&[
+            "-s",
+            serial,
+            "shell",
+            "cmd",
+            "package",
+            "query-activities",
+            "--brief",
+            "--components",
+            "--user",
+            &u,
+            "-a",
+            "android.intent.action.MAIN",
+            "-c",
+            "android.intent.category.LAUNCHER",
+        ]) {
+            Ok(o) => o,
+            Err(_) => return vec![],
+        };
+        // 输出每行形如 "com.tencent.mm/.ui.LauncherUI"（--components 时）
+        parse_launchable_output(&out)
+    }
+
+    /// 查询设备物理屏幕分辨率（`wm size`），返回 (宽, 高)
+    pub fn wm_size(&self, serial: &str) -> Option<(u32, u32)> {
+        let out = self.run(&["-s", serial, "shell", "wm", "size"]).ok()?;
+        parse_wm_size(&out)
+    }
+
+    /// adb mDNS 后端诊断（`adb mdns check`），用于排查无线调试发现问题
+    pub fn mdns_check(&self) -> Option<String> {
+        self.run(&["mdns", "check"]).ok()
+    }
+
+    /// 解析包在指定用户下的启动 Activity（component，如 com.gof.china/.MainActivity）。
+    ///
+    /// 返回 `Err` 时携带 adb 真实输出，避免误导为"未创建分身"。
+    ///
+    /// 注意（已在荣耀 Magic user 128 实测）：
+    /// - 分身场景必须带 `--brief --components`（与 escrcpy 一致），
+    ///   单独 `--brief` 配 `--user` 在 MagicOS 上返回空 → 误报"未找到应用"。
+    /// - 部分设备（如努比亚/华为分身场景）不接受 `--user=N` 等号形式，
+    ///   必须用 `--user N` 空格形式；这里空格优先，失败时再用等号形式兜底一次。
+    pub fn resolve_activity(&self, serial: &str, user: i32, pkg: &str) -> Result<String, String> {
+        let u = user.to_string();
         let out = self
             .run(&[
                 "-s",
@@ -127,27 +196,135 @@ impl Adb {
                 "cmd",
                 "package",
                 "resolve-activity",
-                &u,
                 "--brief",
+                "--components",
+                "--user",
+                &u,
                 pkg,
             ])
-            .ok()?;
-        // 输出第二行才是 component（首行是 priority=... 元信息）
-        out.lines()
-            .map(|l| l.trim())
-            .find(|l| l.contains('/') && !l.starts_with("No activity"))
-            .map(|s| s.to_string())
+            .or_else(|_| {
+                let eq = format!("--user={user}");
+                self.run(&[
+                    "-s",
+                    serial,
+                    "shell",
+                    "cmd",
+                    "package",
+                    "resolve-activity",
+                    "--brief",
+                    "--components",
+                    &eq,
+                    pkg,
+                ])
+            });
+        let out = out.map_err(|e| format!("resolve-activity 执行失败: {e}"))?;
+        for line in out.lines() {
+            let l = line.trim();
+            if l.contains('/')
+                && !l.starts_with("No activity")
+                && !l.starts_with("priority=")
+                && !l.starts_with("Warning")
+            {
+                return Ok(l.to_string());
+            }
+        }
+        Err(format!(
+            "在 user {user} 中解析不到 {pkg} 的启动 Activity（adb 输出：{}）",
+            out.trim()
+        ))
     }
 
-    /// 以指定用户启动应用（分身场景；component 来自 resolve_activity）
+    /// 以指定用户启动应用（分身场景；component 来自 resolve_activity）。
+    /// 同样优先空格形式 `--user N`，失败时用等号形式兜底。
     pub fn start_app_for_user(
         &self,
         serial: &str,
         user: i32,
         component: &str,
     ) -> Result<String, String> {
-        let u = format!("--user={user}");
-        self.run(&["-s", serial, "shell", "am", "start", &u, "-n", component])
+        let u = user.to_string();
+        let eq = format!("--user={user}");
+        let r = self.run(&["-s", serial, "shell", "am", "start", "--user", &u, "-n", component]);
+        match r {
+            Ok(o) => {
+                if o.contains("Error") || o.contains("Exception") {
+                    self.run(&["-s", serial, "shell", "am", "start", &eq, "-n", component])
+                } else {
+                    Ok(o)
+                }
+            }
+            Err(_) => self.run(&["-s", serial, "shell", "am", "start", &eq, "-n", component]),
+        }
+    }
+
+    /// 以指定用户把应用启动到**指定虚拟显示器**上（分身投屏，对齐 escrcpy）。
+    ///
+    /// `display_id` 来自 `scrcpy --new-display` 输出中解析出的虚拟显示器 ID；
+    /// `am start-activity --user N --display <id> -n <component>` 让应用渲染到
+    /// scrcpy 窗口对应的虚拟显示器，手机主屏不受影响。
+    /// 优先空格形式 `--user N --display D`，失败时用等号形式兜底。
+    pub fn start_app_for_user_on_display(
+        &self,
+        serial: &str,
+        user: i32,
+        component: &str,
+        display_id: i32,
+    ) -> Result<String, String> {
+        let u = user.to_string();
+        let d = display_id.to_string();
+        let args = [
+            "-s",
+            serial,
+            "shell",
+            "am",
+            "start-activity",
+            "--user",
+            &u,
+            "--display",
+            &d,
+            "-n",
+            component,
+        ];
+        let r = self.run(&args);
+        match r {
+            Ok(o) => {
+                if o.contains("Error")
+                    || o.contains("Exception")
+                    || o.contains("Warning: Activity not started")
+                {
+                    let eq_u = format!("--user={user}");
+                    let eq_d = format!("--display={display_id}");
+                    self.run(&[
+                        "-s",
+                        serial,
+                        "shell",
+                        "am",
+                        "start-activity",
+                        &eq_u,
+                        &eq_d,
+                        "-n",
+                        component,
+                    ])
+                } else {
+                    Ok(o)
+                }
+            }
+            Err(_) => {
+                let eq_u = format!("--user={user}");
+                let eq_d = format!("--display={display_id}");
+                self.run(&[
+                    "-s",
+                    serial,
+                    "shell",
+                    "am",
+                    "start-activity",
+                    &eq_u,
+                    &eq_d,
+                    "-n",
+                    component,
+                ])
+            }
+        }
     }
 
     /// 重置手势导航相关设置（修复部分机型无线调试连接后侧滑/从底部滑动失效）。
@@ -207,6 +384,18 @@ impl Adb {
         self.run(&["-s", serial, "shell", "getprop", prop])
             .ok()
             .filter(|s| !s.is_empty() && s != "unknown")
+    }
+
+    /// 判断是否为荣耀/华为设备（手势热区"物理化"修复只对这类设备必要；
+    /// 类原生设备如努比亚不受虚拟显示器分辨率污染影响）
+    pub fn is_honor_device(&self, serial: &str) -> bool {
+        ["ro.product.brand", "ro.product.manufacturer"]
+            .iter()
+            .filter_map(|k| self.getprop(serial, k))
+            .any(|v| {
+                let v = v.to_lowercase();
+                v.contains("honor") || v.contains("huawei")
+            })
     }
 }
 
@@ -306,6 +495,44 @@ fn parse_mdns_output(out: &str) -> Vec<MdnsService> {    let mut list = Vec::new
     list
 }
 
+/// 解析 `wm size` 输出，取 Physical size（忽略 Override size）
+fn parse_wm_size(out: &str) -> Option<(u32, u32)> {
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Physical size:") {
+            let rest = rest.trim();
+            if let Some((w, h)) = rest.split_once('x') {
+                let w = w.trim().parse::<u32>().ok()?;
+                let h = h.trim().parse::<u32>().ok()?;
+                if w > 0 && h > 0 {
+                    return Some((w, h));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 解析 `cmd package query-activities --components` 输出。
+/// 每行形如 "com.tencent.mm/.ui.LauncherUI"（组件形式），取包名。
+fn parse_launchable_output(out: &str) -> Vec<String> {
+    let mut list = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // 兼容 "package/activity" 与 "package/.Activity" 等形态
+        if let Some((p, _)) = line.split_once('/') {
+            let p = p.trim().to_string();
+            if !p.is_empty() {
+                list.push(p);
+            }
+        }
+    }
+    list
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +583,32 @@ Users:
         assert_eq!(users[0].name, "分身应用");
         assert_eq!(users[1].id, 999);
         assert_eq!(users[1].name, "应用分身");
+    }
+
+    #[test]
+    fn parse_wm_size_physical() {
+        let sample = "\
+Physical size: 1260x2800
+Override size: 1260x2800
+";
+        assert_eq!(parse_wm_size(sample), Some((1260, 2800)));
+        // 只有物理大小
+        assert_eq!(parse_wm_size("Physical size: 1080x2400"), Some((1080, 2400)));
+        // 无效行
+        assert_eq!(parse_wm_size("Physical size: abc"), None);
+        assert_eq!(parse_wm_size(""), None);
+    }
+
+    #[test]
+    fn parse_launchable() {
+        let sample = "\
+com.tencent.mm/.ui.LauncherUI
+com.gof.china/.MainActivity
+org.telegram.messenger/.DefaultIcon
+";
+        let pkgs = parse_launchable_output(sample);
+        assert_eq!(pkgs, vec!["com.tencent.mm", "com.gof.china", "org.telegram.messenger"]);
+        // 表头/空行被跳过
+        assert_eq!(parse_launchable_output("header\n\n"), Vec::<String>::new());
     }
 }

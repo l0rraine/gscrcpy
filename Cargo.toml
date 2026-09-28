@@ -7,6 +7,7 @@ edition = "2024"
 arboard = "3.6.1"
 dirs = "7.0.0"
 eframe = "0.36.2"
+mdns-sd = "0.21"
 qrcode = "0.14.1"
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -3,6 +3,7 @@
 mod adb;
 mod app;
 mod config;
+mod mdns;
 mod pairing;
 mod scrcpy;
 mod updater;

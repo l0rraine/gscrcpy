@@ -41,6 +41,15 @@ pub struct Config {
     /// 设备连接上之后自动重置手势导航（修复部分机型无线调试后侧滑/底部滑动失效）
     #[serde(default = "default_true")]
     pub restore_gesture: bool,
+    /// 屏蔽 IP 格式设备（同一手机只显示 mDNS 串号；没有对应串号的纯 IP 设备折叠显示）
+    #[serde(default = "default_true")]
+    pub hide_ip_devices: bool,
+    /// 分身投屏模式：false=虚拟显示器（手机屏幕不被占用，但系统手势不可用，
+    /// 需用 scrcpy 快捷键代替：右键=返回、Alt/Super+H=桌面、Alt/Super+S=最近任务）；
+    /// true=直接镜像（分身应用在手机前台启动并镜像到 scrcpy，系统手势可用，
+    /// 但手机屏幕会被应用占用）。与 escrcpy 的"直接镜像/新显示器"两种模式对应。
+    #[serde(default)]
+    pub clone_direct_mirror: bool,
 }
 
 fn default_true() -> bool {
@@ -69,6 +78,8 @@ impl Default for Config {
             last_resolution: None,
             last_app_label: None,
             restore_gesture: true,
+            hide_ip_devices: true,
+            clone_direct_mirror: false,
         }
     }
 }
@@ -99,6 +110,18 @@ impl Config {
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(p, s);
         }
+    }
+
+    /// 旧版默认窗口参数迁移：旧默认 1080x1920（竖屏）与 scrcpy 默认 1920x1080（横屏）
+    /// 比例相反，直接启动会出现画面只占一部分。检测到旧默认值则迁移为 1920x1080。
+    /// 返回是否发生了迁移（调用方负责保存）。
+    pub fn migrate_bad_defaults(&mut self) -> bool {
+        if self.window_width == 1080 && self.window_height == 1920 {
+            self.window_width = 1920;
+            self.window_height = 1080;
+            return true;
+        }
+        false
     }
 
     /// 设备别名（忽略空字符串）
@@ -139,6 +162,8 @@ mod tests {
         let c2: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(c2.alias("abc"), Some("我的手机"));
         assert_eq!(c2.window_width, 1080);
+        assert!(c2.hide_ip_devices);
+        assert!(!c2.clone_direct_mirror);
     }
 
     #[test]
@@ -148,5 +173,20 @@ mod tests {
         assert_eq!(l, vec!["c", "a"]);
         Config::push_unique(&mut l, "b".into(), 2);
         assert_eq!(l, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn migrate_bad_defaults_swaps() {
+        let mut c = Config::default();
+        assert_eq!((c.window_width, c.window_height), (1080, 1920));
+        assert!(c.migrate_bad_defaults());
+        assert_eq!((c.window_width, c.window_height), (1920, 1080));
+        // 幂等：再迁移一次无变化
+        assert!(!c.migrate_bad_defaults());
+        // 非旧默认值不动
+        let mut c2 = Config::default();
+        c2.window_width = 1260;
+        c2.window_height = 2800;
+        assert!(!c2.migrate_bad_defaults());
     }
 }

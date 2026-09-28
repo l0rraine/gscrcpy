@@ -1,3 +1,4 @@
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -39,13 +40,15 @@ impl Scrcpy {
         t.lines().next().map(|l| l.trim().to_string())
     }
 
-    /// 按用户参数模板拼装启动参数
+    /// 按用户参数模板拼装启动参数（机主应用 / 直接镜像场景）。
     ///
-    /// 模板：scrcpy -s "<serial>" --new-display=<WxH> [--start-app=<pkg>]
+    /// 模板：scrcpy -s "<serial>" [--new-display=<WxH>] [--start-app=<pkg>]
     ///        --window-width=<w> --window-height=<h> --window-title="<title>"
     ///
-    /// `start_app`：分身应用场景传 None（scrcpy 4.x 不支持 --user，
-    /// 分身由上层先 `am start --user <id>` 启动，scrcpy 只负责投屏）。
+    /// - `resolution` 为空 = 直接镜像物理屏幕（不加 --new-display），
+    ///   画面比例自动匹配，不会出现 app 只占一部分。
+    /// - `start_app`：分身应用场景传 None（scrcpy 4.x 不支持 --user，
+    ///   分身由上层 `am start --user <id>` 启动，scrcpy 只负责投屏）。
     ///
     /// 注意：scrcpy 4.x 的长选项一律要求 `--opt=value` 形式（等号），
     /// 不能拆成两个参数；短选项 `-s` 用空格分隔。
@@ -61,11 +64,41 @@ impl Scrcpy {
         let mut args = vec![
             "-s".to_string(),
             serial.to_string(),
-            format!("--new-display={resolution}"),
         ];
+        if !resolution.is_empty() {
+            args.push(format!("--new-display={resolution}"));
+        }
         if let Some(pkg) = start_app {
             args.push(format!("--start-app={pkg}"));
         }
+        if win_w > 0 {
+            args.push(format!("--window-width={win_w}"));
+        }
+        if win_h > 0 {
+            args.push(format!("--window-height={win_h}"));
+        }
+        if !title.is_empty() {
+            args.push(format!("--window-title={title}"));
+        }
+        args
+    }
+
+    /// 分身虚拟显示器投屏参数：总是创建虚拟显示器 `--new-display=<resolution>`，
+    /// 不传 `--start-app`（分身应用由上层解析出组件后
+    /// `am start-activity --user N --display <id> -n <component>` 启动到该显示器）。
+    pub fn build_clone_args(
+        &self,
+        serial: &str,
+        resolution: &str,
+        win_w: u32,
+        win_h: u32,
+        title: &str,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-s".to_string(),
+            serial.to_string(),
+            format!("--new-display={resolution}"),
+        ];
         if win_w > 0 {
             args.push(format!("--window-width={win_w}"));
         }
@@ -105,7 +138,8 @@ impl Scrcpy {
     }
 
     /// 异步启动 scrcpy：无控制台窗口，日志追加到配置目录 scrcpy.log
-    pub fn launch(&self, args: &[String]) -> Result<(), String> {        let mut cmd = Command::new(self.exe());
+    pub fn launch(&self, args: &[String]) -> Result<(), String> {
+        let mut cmd = Command::new(self.exe());
         cmd.args(args);
         cmd.stdin(Stdio::null());
         #[cfg(windows)]
@@ -135,6 +169,104 @@ impl Scrcpy {
         cmd.env("ADB", self.adb());
         cmd.spawn()
             .map_err(|e| format!("启动 scrcpy 失败: {e}"))?;
+        Ok(())
+    }
+
+    /// 创建虚拟显示器并投屏（分身场景）。
+    ///
+    /// 等待 scrcpy 在 stdout 输出 `displayId: N`（虚拟显示器创建成功的唯一标志），
+    /// 解析返回显示器 ID，供 `am start-activity --display <id>` 使用。
+    /// displayId 每次启动都动态变化，必须实时解析，不能硬编码。
+    pub fn launch_with_new_display(&self, args: &[String]) -> Result<i32, String> {
+        self.spawn_with_display(args).map(|(id, _child)| id)
+    }
+
+    /// 内部实现：spawn scrcpy 并解析虚拟显示器 ID，成功返回 `(display_id, child)`。
+    /// child 由调用方决定继续持有（正常投屏，drop 后进程保持运行）或立即结束
+    /// （手势热区"物理化"修复）。
+    fn spawn_with_display(&self, args: &[String]) -> Result<(i32, std::process::Child), String> {
+        let mut cmd = Command::new(self.exe());
+        cmd.args(args);
+        cmd.stdin(Stdio::null());
+        // 必须用管道接管 stdout，否则 child.stdout 为 None（继承），
+        // 无法实时解析虚拟显示器 ID（displayId）
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.env("ADB", self.adb());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("启动 scrcpy 失败: {e}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "无法读取 scrcpy 输出".to_string())?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stdout);
+            let mut recent: Vec<String> = Vec::new();
+            for line in reader.lines() {
+                let line = line.unwrap_or_default();
+                if let Some(id) = parse_display_id(&line) {
+                    let _ = tx.send(Ok(id));
+                    return;
+                }
+                recent.push(line);
+                if recent.len() > 20 {
+                    recent.remove(0);
+                }
+            }
+            let tail = recent.last().cloned().unwrap_or_else(|| "(无输出)".to_string());
+            let _ = tx.send(Err(format!(
+                "scrcpy 未输出 displayId，退出前最后输出: {tail}"
+            )));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(25)) {
+            Ok(Ok(id)) => Ok((id, child)),
+            Ok(Err(e)) => {
+                let _ = child.kill();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = child.kill();
+                Err(
+                    "等待虚拟显示器创建超时（25 秒）：scrcpy 未能创建显示器。可能原因：adb 连接已断开、设备未解锁、或分辨率参数不被支持。建议手动运行同一条 scrcpy 命令查看输出。"
+                        .to_string(),
+                )
+            }
+        }
+    }
+
+    /// 荣耀/华为设备专用：把 SystemUI 手势热区"物理化"（手动触发）。
+    ///
+    /// MagicOS 实测：虚拟显示器按非物理分辨率（如 1920x1280）创建后，系统会把主屏
+    /// 手势热区（GestureNav）注册成虚拟显示器分辨率，导致手机本机部分区域手势失效
+    /// （如底部上滑/右侧滑动无效）。创建一次物理分辨率虚拟显示器再立即结束，手势
+    /// 热区即重新注册为物理屏幕尺寸并固化——即使其他虚拟显示器继续投屏、或之后
+    /// 全部移除，热区也保持物理尺寸，手机手势恢复正常，无需重启手机。
+    ///
+    /// 由用户在"手机触控/手势不正常"时手动调用。
+    pub fn repair_gesture_hotzone(&self, serial: &str, w: u32, h: u32) -> Result<(), String> {
+        let tmp_rec = std::env::temp_dir().join(format!(
+            "gscrcpy_gesture_repair_{}_{}x{}.mp4",
+            std::process::id(),
+            w,
+            h
+        ));
+        let _ = std::fs::remove_file(&tmp_rec);
+        let args = vec![
+            "-s".to_string(),
+            serial.to_string(),
+            format!("--new-display={w}x{h}"),
+            "--no-window".to_string(),
+            "--no-audio".to_string(),
+            format!("--record={}", tmp_rec.display()),
+        ];
+        // 物理尺寸虚拟显示器创建成功即完成热区注册，立即结束 scrcpy 移除显示器
+        let (_, mut child) = self.spawn_with_display(&args)?;
+        let _ = child.kill();
+        let _ = std::fs::remove_file(&tmp_rec);
         Ok(())
     }
 }
@@ -172,17 +304,41 @@ fn parse_app_list_output(out: &str) -> Vec<AppInfo> {
     list
 }
 
+/// 从 scrcpy stdout 行解析虚拟显示器 ID。
+/// scrcpy 4.x 创建虚拟显示器成功后输出形如 `[server] INFO: New display: 1920x1080 (id=2)`
+/// （escrcpy 用正则 `/New display:.+?\(id=(\d+)\)/i` 匹配）；
+/// 旧版（3.x）输出形如 `[server] INFO: displayId: 2`，两种格式都兼容。
+fn parse_display_id(line: &str) -> Option<i32> {
+    let line = line.trim();
+    // scrcpy 4.x 格式：New display: <w>x<h> (id=<N>)
+    if line.to_ascii_lowercase().contains("new display") {
+        if let Some(idx) = line.rfind("(id=") {
+            let rest = &line[idx + "(id=".len()..];
+            return rest.trim_end_matches(')').trim().parse::<i32>().ok();
+        }
+    }
+    // 旧版格式：[server] INFO: displayId: 2
+    if let Some(idx) = line.rfind("displayId:") {
+        let rest = &line[idx + "displayId:".len()..];
+        return rest.trim().parse::<i32>().ok();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn s() -> Scrcpy {
+        Scrcpy {
+            dir: PathBuf::from("D:/x"),
+        }
+    }
+
     #[test]
     fn args_template() {
-        let s = Scrcpy {
-            dir: PathBuf::from("D:/x"),
-        };
-        let args = s.build_args(
+        let args = s().build_args(
             "adb-D1222091020A-aWsoaY._adb-tls-connect._tcp",
             Some("com.gof.china"),
             "1920x1080",
@@ -201,23 +357,35 @@ mod tests {
 
     #[test]
     fn args_omit_zero_size() {
-        let s = Scrcpy {
-            dir: PathBuf::from("D:/x"),
-        };
-        let args = s.build_args("s", Some("p"), "1280x720", 0, 0, "");
+        let args = s().build_args("s", Some("p"), "1280x720", 0, 0, "");
         assert!(!args.iter().any(|a| a.contains("window-width")));
         assert!(!args.iter().any(|a| a.contains("window-title")));
     }
 
     #[test]
     fn args_no_start_app_for_clone_user() {
-        let s = Scrcpy {
-            dir: PathBuf::from("D:/x"),
-        };
         // 分身场景：不传 --start-app（由 am start --user 提前启动）
-        let args = s.build_args("s", None, "1280x720", 100, 200, "分身 - 华为");
+        let args = s().build_args("s", None, "1280x720", 100, 200, "分身 - 华为");
         assert!(!args.iter().any(|a| a.contains("--start-app")));
         assert!(args.contains(&"--new-display=1280x720".to_string()));
+    }
+
+    #[test]
+    fn args_empty_resolution_direct_mirror() {
+        // 空分辨率 = 直接镜像物理屏幕：不加 --new-display
+        let args = s().build_args("s", Some("p"), "", 0, 0, "t");
+        assert!(!args.iter().any(|a| a.contains("--new-display")));
+        assert!(args.contains(&"-s".to_string()));
+    }
+
+    #[test]
+    fn clone_args_always_new_display() {
+        // 分身虚拟显示器：总是 --new-display，且不传 --start-app
+        let args = s().build_clone_args("s", "1920x1080", 1920, 1080, "无尽冬日 - Magic");
+        assert!(args.contains(&"--new-display=1920x1080".to_string()));
+        assert!(!args.iter().any(|a| a.contains("--start-app")));
+        assert!(args.contains(&"--window-width=1920".to_string()));
+        assert!(args.contains(&"--window-title=无尽冬日 - Magic".to_string()));
     }
 
     #[test]
@@ -240,5 +408,24 @@ mod tests {
         assert!(!apps[2].is_system);
         // INFO 行被跳过
         assert!(apps.iter().all(|a| a.name != "[server] INFO: List of apps:"));
+    }
+
+    #[test]
+    fn parse_display_id_from_line() {
+        // scrcpy 4.x 格式：New display: <w>x<h> (id=<N>)
+        assert_eq!(
+            parse_display_id("[server] INFO: New display: 1920x1080 (id=2)"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_display_id("[server] INFO: New display: 1280x2800 (id=5)"),
+            Some(5)
+        );
+        // 旧版格式：[server] INFO: displayId: 2
+        assert_eq!(parse_display_id("[server] INFO: displayId: 2"), Some(2));
+        assert_eq!(parse_display_id("INFO: displayId: 5"), Some(5));
+        // 噪声行
+        assert_eq!(parse_display_id("scrcpy 4.1 <https://github.com/Genymobile/scrcpy>"), None);
+        assert_eq!(parse_display_id(""), None);
     }
 }
