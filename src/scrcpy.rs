@@ -60,6 +60,7 @@ impl Scrcpy {
         win_w: u32,
         win_h: u32,
         title: &str,
+        audio: bool,
     ) -> Vec<String> {
         let mut args = vec![
             "-s".to_string(),
@@ -80,6 +81,9 @@ impl Scrcpy {
         if !title.is_empty() {
             args.push(format!("--window-title={title}"));
         }
+        if !audio {
+            args.push("--no-audio".to_string());
+        }
         args
     }
 
@@ -93,6 +97,7 @@ impl Scrcpy {
         win_w: u32,
         win_h: u32,
         title: &str,
+        audio: bool,
     ) -> Vec<String> {
         let mut args = vec![
             "-s".to_string(),
@@ -107,6 +112,9 @@ impl Scrcpy {
         }
         if !title.is_empty() {
             args.push(format!("--window-title={title}"));
+        }
+        if !audio {
+            args.push("--no-audio".to_string());
         }
         args
     }
@@ -153,6 +161,17 @@ impl Scrcpy {
             .to_path_buf();
         let _ = std::fs::create_dir_all(&log_dir);
         let log = log_dir.join("scrcpy.log");
+        // 记录本次启动参数（诊断音频/分辨率等参数是否传入）
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
+            let _ = std::io::Write::write_all(
+                &mut std::io::BufWriter::new(&f),
+                format!("[gscrcpy] launch: {}\n", args.join(" ")).as_bytes(),
+            );
+        }
         if let Ok(f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -191,6 +210,19 @@ impl Scrcpy {
     /// child 由调用方决定继续持有（正常投屏，drop 后进程保持运行）或立即结束
     /// （手势热区"物理化"修复）。
     fn spawn_with_display(&self, args: &[String]) -> Result<(i32, std::process::Child), String> {
+        // 记录本次启动参数（诊断音频/分辨率等参数是否传入）
+        let log_dir = crate::config::Config::path()
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log = log_dir.join("scrcpy.log");
+        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+            let _ = std::io::Write::write_all(
+                &mut std::io::BufWriter::new(&f),
+                format!("[gscrcpy] launch(vd): {}\n", args.join(" ")).as_bytes(),
+            );
+        }
         let mut cmd = Command::new(self.exe());
         cmd.args(args);
         cmd.stdin(Stdio::null());
@@ -351,6 +383,7 @@ mod tests {
             1080,
             1920,
             "com.gof.china - 小米14",
+            true,
         );
         let joined = args.join(" ");
         assert!(joined.contains(r#"-s adb-D1222091020A-aWsoaY._adb-tls-connect._tcp"#));
@@ -363,7 +396,7 @@ mod tests {
 
     #[test]
     fn args_omit_zero_size() {
-        let args = s().build_args("s", Some("p"), "1280x720", 0, 0, "");
+        let args = s().build_args("s", Some("p"), "1280x720", 0, 0, "", true);
         assert!(!args.iter().any(|a| a.contains("window-width")));
         assert!(!args.iter().any(|a| a.contains("window-title")));
     }
@@ -371,7 +404,7 @@ mod tests {
     #[test]
     fn args_no_start_app_for_clone_user() {
         // 分身场景：不传 --start-app（由 am start --user 提前启动）
-        let args = s().build_args("s", None, "1280x720", 100, 200, "分身 - 华为");
+        let args = s().build_args("s", None, "1280x720", 100, 200, "分身 - 华为", true);
         assert!(!args.iter().any(|a| a.contains("--start-app")));
         assert!(args.contains(&"--new-display=1280x720".to_string()));
     }
@@ -379,15 +412,24 @@ mod tests {
     #[test]
     fn args_empty_resolution_direct_mirror() {
         // 空分辨率 = 直接镜像物理屏幕：不加 --new-display
-        let args = s().build_args("s", Some("p"), "", 0, 0, "t");
+        let args = s().build_args("s", Some("p"), "", 0, 0, "t", true);
         assert!(!args.iter().any(|a| a.contains("--new-display")));
         assert!(args.contains(&"-s".to_string()));
     }
 
     #[test]
+    fn args_audio_off_adds_no_audio() {
+        // audio=false：机主与分身场景都应传 --no-audio（不转接声音）
+        let a = s().build_args("s", Some("p"), "", 0, 0, "t", false);
+        assert!(a.contains(&"--no-audio".to_string()));
+        let b = s().build_clone_args("s", "1280x720", 0, 0, "t", false);
+        assert!(b.contains(&"--no-audio".to_string()));
+    }
+
+    #[test]
     fn clone_args_always_new_display() {
         // 分身虚拟显示器：总是 --new-display，且不传 --start-app
-        let args = s().build_clone_args("s", "1920x1080", 1920, 1080, "无尽冬日 - Magic");
+        let args = s().build_clone_args("s", "1920x1080", 1920, 1080, "无尽冬日 - Magic", true);
         assert!(args.contains(&"--new-display=1920x1080".to_string()));
         assert!(!args.iter().any(|a| a.contains("--start-app")));
         assert!(args.contains(&"--window-width=1920".to_string()));

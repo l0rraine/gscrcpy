@@ -815,7 +815,7 @@ impl GScrcpyApp {
             self.device_display(&serial)
         );
         // 直接镜像物理屏幕：分辨率/窗口全部留空，不建虚拟显示器
-        let args = scrcpy.build_args(&serial, None, "", 0, 0, &title);
+        let args = scrcpy.build_args(&serial, None, "", 0, 0, &title, profile.audio_enabled);
         self.run_scrcpy(&scrcpy, &args, false, false);
         self.persist_usage(&profile);
     }
@@ -888,7 +888,7 @@ impl GScrcpyApp {
         if let Some(uid) = clone_user {
             if app.is_none() {
                 // 映射屏幕 + 分身 profile：镜像主屏即可（分身信息仅用于启动 app）
-                let args = scrcpy.build_args(serial, None, &res, ww, wh, &title);
+                let args = scrcpy.build_args(serial, None, &res, ww, wh, &title, profile.audio_enabled);
                 self.run_scrcpy(&scrcpy, &args, false, false);
                 self.persist_usage(profile);
                 return;
@@ -941,7 +941,7 @@ impl GScrcpyApp {
                 } else {
                     res
                 };
-                let args = scrcpy.build_clone_args(serial, &res, ww, wh, &title);
+                let args = scrcpy.build_clone_args(serial, &res, ww, wh, &title, profile.audio_enabled);
                 let (display_id, _child) = match scrcpy.launch_with_new_display_child(&args) {
                     Ok(v) => v,
                     Err(e) => {
@@ -986,7 +986,7 @@ impl GScrcpyApp {
             }
         } else if let Some(pkg) = app {
             // 机主应用
-            let args = scrcpy.build_args(serial, Some(pkg), &res, ww, wh, &title);
+            let args = scrcpy.build_args(serial, Some(pkg), &res, ww, wh, &title, profile.audio_enabled);
             let virtual_display = args.iter().any(|a| a.contains("--new-display"));
             self.run_scrcpy(
                 &scrcpy,
@@ -997,7 +997,7 @@ impl GScrcpyApp {
             self.persist_usage(profile);
         } else {
             // 映射屏幕（无分身、无 app）
-            let args = scrcpy.build_args(serial, None, &res, ww, wh, &title);
+            let args = scrcpy.build_args(serial, None, &res, ww, wh, &title, profile.audio_enabled);
             let virtual_display = args.iter().any(|a| a.contains("--new-display"));
             self.run_scrcpy(
                 &scrcpy,
@@ -1265,6 +1265,16 @@ impl GScrcpyApp {
         {
             self.config.save();
             self.refresh_once();
+        }
+
+        // 选中设备已不在列表（设备断开/列表为空）时立即清除选中与编辑副本，
+        // 避免 UI 残留上次选中的设备信息（与 apply_devices 双保险）
+        if let Some(sel) = &self.selected_serial {
+            if !self.devices.iter().any(|d| &d.serial == sel) {
+                self.selected_serial = None;
+                self.profile_edit = None;
+                self.renaming_profile = None;
+            }
         }
 
         let mut to_select: Option<String> = None;
@@ -1907,6 +1917,11 @@ impl GScrcpyApp {
             );
         });
 
+        // 音频转接开关：勾选 = 转接手机声音到电脑；不勾 = 不转接（声音留在手机）
+        let mut edit_audio = edit.audio_enabled;
+        ui.checkbox(&mut edit_audio, "转接手机音频");
+
+
         // 应用/标题/分辨率变更 → 写回编辑副本并保存（分身投屏固定为虚拟显示器模式，
         // 手势热区固定为 Auto，投屏结束后由后台线程自动物理化修复，均无需界面配置）
 
@@ -1926,6 +1941,10 @@ impl GScrcpyApp {
         }
         if edit_res != edit.resolution {
             edit.resolution = edit_res;
+            changed = true;
+        }
+        if edit_audio != edit.audio_enabled {
+            edit.audio_enabled = edit_audio;
             changed = true;
         }
         if changed {

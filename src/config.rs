@@ -40,6 +40,12 @@ pub struct Profile {
     /// 手势热区修复模式
     #[serde(default)]
     pub gesture_fix: GestureFixMode,
+    /// 启动 app 时是否转接手机音频（scrcpy 3.x+ 默认把设备全部声音转发到电脑；
+    /// false = 传 --no-audio）。设备级混音无法只转打开 app 的声音——
+    /// "转"就是转全部（含通知/其他 app），因此启动 app 场景默认不转接
+    /// （声音留在手机）；映射屏幕场景固定转接全部声音。
+    #[serde(default)]
+    pub audio_enabled: bool,
 }
 
 impl Default for Profile {
@@ -51,6 +57,7 @@ impl Default for Profile {
             app_label: String::new(),
             resolution: String::new(),
             gesture_fix: GestureFixMode::Off,
+            audio_enabled: false,
         }
     }
 }
