@@ -61,10 +61,14 @@ impl Scrcpy {
         win_h: u32,
         title: &str,
         audio: bool,
+        screen_off: bool,
+        limit_fps: bool,
     ) -> Vec<String> {
         let mut args = vec![
             "-s".to_string(),
             serial.to_string(),
+            // Windows 硬件渲染（比默认 OpenGL 更流畅，减轻无线投屏卡顿）
+            "--render-driver=direct3d".to_string(),
         ];
         if !resolution.is_empty() {
             args.push(format!("--new-display={resolution}"));
@@ -84,6 +88,15 @@ impl Scrcpy {
         if !audio {
             args.push("--no-audio".to_string());
         }
+        if screen_off {
+            // scrcpy 4.x boolean 选项不带 =true（--turn-screen-off 即关闭屏幕，
+            // 投屏期间关屏、投屏结束恢复）
+            args.push("--turn-screen-off".to_string());
+        }
+        if limit_fps {
+            // 无线投屏带宽有限：限帧 30fps 减少传输压力，画面更稳定
+            args.push("--max-fps=30".to_string());
+        }
         args
     }
 
@@ -98,10 +111,14 @@ impl Scrcpy {
         win_h: u32,
         title: &str,
         audio: bool,
+        screen_off: bool,
+        limit_fps: bool,
     ) -> Vec<String> {
         let mut args = vec![
             "-s".to_string(),
             serial.to_string(),
+            // Windows 硬件渲染（比默认 OpenGL 更流畅，减轻无线投屏卡顿）
+            "--render-driver=direct3d".to_string(),
             format!("--new-display={resolution}"),
         ];
         if win_w > 0 {
@@ -115,6 +132,14 @@ impl Scrcpy {
         }
         if !audio {
             args.push("--no-audio".to_string());
+        }
+        if screen_off {
+            // scrcpy 4.x boolean 选项不带 =true
+            args.push("--turn-screen-off".to_string());
+        }
+        if limit_fps {
+            // 无线投屏带宽有限：限帧 30fps 减少传输压力，画面更稳定
+            args.push("--max-fps=30".to_string());
         }
         args
     }
@@ -384,6 +409,8 @@ mod tests {
             1920,
             "com.gof.china - 小米14",
             true,
+            false,
+            false,
         );
         let joined = args.join(" ");
         assert!(joined.contains(r#"-s adb-D1222091020A-aWsoaY._adb-tls-connect._tcp"#));
@@ -396,7 +423,7 @@ mod tests {
 
     #[test]
     fn args_omit_zero_size() {
-        let args = s().build_args("s", Some("p"), "1280x720", 0, 0, "", true);
+        let args = s().build_args("s", Some("p"), "1280x720", 0, 0, "", true, false, false);
         assert!(!args.iter().any(|a| a.contains("window-width")));
         assert!(!args.iter().any(|a| a.contains("window-title")));
     }
@@ -404,7 +431,7 @@ mod tests {
     #[test]
     fn args_no_start_app_for_clone_user() {
         // 分身场景：不传 --start-app（由 am start --user 提前启动）
-        let args = s().build_args("s", None, "1280x720", 100, 200, "分身 - 华为", true);
+        let args = s().build_args("s", None, "1280x720", 100, 200, "分身 - 华为", true, false, false);
         assert!(!args.iter().any(|a| a.contains("--start-app")));
         assert!(args.contains(&"--new-display=1280x720".to_string()));
     }
@@ -412,7 +439,7 @@ mod tests {
     #[test]
     fn args_empty_resolution_direct_mirror() {
         // 空分辨率 = 直接镜像物理屏幕：不加 --new-display
-        let args = s().build_args("s", Some("p"), "", 0, 0, "t", true);
+        let args = s().build_args("s", Some("p"), "", 0, 0, "t", true, false, false);
         assert!(!args.iter().any(|a| a.contains("--new-display")));
         assert!(args.contains(&"-s".to_string()));
     }
@@ -420,16 +447,28 @@ mod tests {
     #[test]
     fn args_audio_off_adds_no_audio() {
         // audio=false：机主与分身场景都应传 --no-audio（不转接声音）
-        let a = s().build_args("s", Some("p"), "", 0, 0, "t", false);
+        let a = s().build_args("s", Some("p"), "", 0, 0, "t", false, false, false);
         assert!(a.contains(&"--no-audio".to_string()));
-        let b = s().build_clone_args("s", "1280x720", 0, 0, "t", false);
+        let b = s().build_clone_args("s", "1280x720", 0, 0, "t", false, false, false);
         assert!(b.contains(&"--no-audio".to_string()));
+    }
+
+    #[test]
+    fn args_screen_off_adds_turn_screen_off() {
+        // screen_off=true：机主与分身场景都应传 --turn-screen-off=true（投屏时关屏）
+        let a = s().build_args("s", Some("p"), "", 0, 0, "t", false, true, false);
+        assert!(a.contains(&"--turn-screen-off".to_string()));
+        let b = s().build_clone_args("s", "1280x720", 0, 0, "t", false, true, false);
+        assert!(b.contains(&"--turn-screen-off".to_string()));
+        // 默认不传
+        let c = s().build_args("s", Some("p"), "", 0, 0, "t", false, false, false);
+        assert!(!c.iter().any(|a| a.contains("--turn-screen-off")));
     }
 
     #[test]
     fn clone_args_always_new_display() {
         // 分身虚拟显示器：总是 --new-display，且不传 --start-app
-        let args = s().build_clone_args("s", "1920x1080", 1920, 1080, "无尽冬日 - Magic", true);
+        let args = s().build_clone_args("s", "1920x1080", 1920, 1080, "无尽冬日 - Magic", true, false, false);
         assert!(args.contains(&"--new-display=1920x1080".to_string()));
         assert!(!args.iter().any(|a| a.contains("--start-app")));
         assert!(args.contains(&"--window-width=1920".to_string()));

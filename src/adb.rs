@@ -386,6 +386,44 @@ impl Adb {
             .filter(|s| !s.is_empty() && s != "unknown")
     }
 
+    /// 读取当前屏幕亮度（0-255）。失败返回 None。
+    pub fn screen_brightness(&self, serial: &str) -> Option<i32> {
+        self.run(&[
+            "-s", serial, "shell", "settings", "get", "system", "screen_brightness",
+        ])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+    }
+
+    /// 设置屏幕亮度（0-255）。忽略失败。
+    pub fn set_screen_brightness(&self, serial: &str, value: i32) {
+        let _ = self.run(&[
+            "-s", serial, "shell", "settings", "put", "system", "screen_brightness",
+            &value.to_string(),
+        ]);
+    }
+
+    /// 读取屏幕亮度模式（0=手动，1=自动）。失败返回 None。
+    pub fn screen_brightness_mode(&self, serial: &str) -> Option<i32> {
+        self.run(&[
+            "-s", serial, "shell", "settings", "get", "system", "screen_brightness_mode",
+        ])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+    }
+
+    /// 设置屏幕亮度模式（0=手动，1=自动）。忽略失败。
+    pub fn set_screen_brightness_mode(&self, serial: &str, value: i32) {
+        let _ = self.run(&[
+            "-s", serial, "shell", "settings", "put", "system", "screen_brightness_mode",
+            &value.to_string(),
+        ]);
+    }
+
     /// 判断是否为荣耀/华为设备（手势热区"物理化"修复只对这类设备必要；
     /// 类原生设备如努比亚不受虚拟显示器分辨率污染影响）
     pub fn is_honor_device(&self, serial: &str) -> bool {

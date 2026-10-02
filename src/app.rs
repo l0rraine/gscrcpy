@@ -99,6 +99,9 @@ pub struct GScrcpyApp {
     latest: Option<Result<updater::ReleaseInfo, String>>,
     update_status: String,
     update_working: bool,
+    /// 投屏调低亮度的残留状态（adb 路径, serial, 原亮度, 原自动亮度模式）。
+    /// 正常由恢复线程在 scrcpy 退出后恢复；进程被直接关闭时由 Drop 兜底恢复。
+    dim_state: Option<(std::path::PathBuf, String, i32, i32)>,
 }
 
 impl GScrcpyApp {
@@ -158,6 +161,7 @@ impl GScrcpyApp {
             latest: None,
             update_status: String::new(),
             update_working: false,
+            dim_state: None,
         };
         // 恢复上次设备；窗口尺寸默认留空（= 与分辨率相同，自动匹配）
         app.selected_serial = app.config.last_serial.clone();
@@ -815,8 +819,8 @@ impl GScrcpyApp {
             self.device_display(&serial)
         );
         // 直接镜像物理屏幕：分辨率/窗口全部留空，不建虚拟显示器
-        let args = scrcpy.build_args(&serial, None, "", 0, 0, &title, profile.audio_enabled);
-        self.run_scrcpy(&scrcpy, &args, false, false);
+        let args = scrcpy.build_args(&serial, None, "", 0, 0, &title, profile.audio_enabled, profile.screen_off, profile.limit_fps);
+        self.run_scrcpy(&scrcpy, &args, false, false, profile.dim_screen);
         self.persist_usage(&profile);
     }
 
@@ -888,8 +892,8 @@ impl GScrcpyApp {
         if let Some(uid) = clone_user {
             if app.is_none() {
                 // 映射屏幕 + 分身 profile：镜像主屏即可（分身信息仅用于启动 app）
-                let args = scrcpy.build_args(serial, None, &res, ww, wh, &title, profile.audio_enabled);
-                self.run_scrcpy(&scrcpy, &args, false, false);
+                let args = scrcpy.build_args(serial, None, &res, ww, wh, &title, profile.audio_enabled, profile.screen_off, profile.limit_fps);
+                self.run_scrcpy(&scrcpy, &args, false, false, profile.dim_screen);
                 self.persist_usage(profile);
                 return;
             }
@@ -941,16 +945,52 @@ impl GScrcpyApp {
                 } else {
                     res
                 };
-                let args = scrcpy.build_clone_args(serial, &res, ww, wh, &title, profile.audio_enabled);
-                let (display_id, _child) = match scrcpy.launch_with_new_display_child(&args) {
+                let args = scrcpy.build_clone_args(serial, &res, ww, wh, &title, profile.audio_enabled, profile.screen_off, profile.limit_fps);
+                // 投屏时调低亮度：启动前记录原亮度并调低
+                let dim = if profile.dim_screen {
+                    self.adb_path.clone().and_then(|adb_path| {
+                        let adb = Adb::new(adb_path.clone());
+                        let s = serial.to_string();
+                        let orig = adb.screen_brightness(&s)?;
+                        let mode = adb.screen_brightness_mode(&s).unwrap_or(0);
+                        // 自动亮度开启时手动亮度无效：先关自动亮度再调低
+                        if mode != 0 {
+                            adb.set_screen_brightness_mode(&s, 0);
+                        }
+                        adb.set_screen_brightness(&s, 1);
+                        Some((adb_path, s, orig, mode))
+                    })
+                } else {
+                    None
+                };
+                // 记录残留状态：进程直接关闭时由 Drop 兜底恢复
+                self.dim_state = dim.clone();
+                // 记录残留状态：进程直接关闭时由 Drop 兜底恢复
+                self.dim_state = dim.clone();
+                let (display_id, child) = match scrcpy.launch_with_new_display_child(&args) {
                     Ok(v) => v,
                     Err(e) => {
+                        if let Some((adb_path, s, orig, mode)) = dim {
+                            let a = Adb::new(adb_path);
+                            a.set_screen_brightness(&s, orig);
+                            a.set_screen_brightness_mode(&s, mode);
+                        }
                         let msg = format!("创建虚拟显示器失败（未启动分身应用）: {e}");
                         self.action_status = msg.clone();
                         self.action_error = true;
                         return;
                     }
                 };
+                // 投屏结束（scrcpy 退出）恢复亮度与自动亮度模式
+                if let Some((adb_path, s, orig, mode)) = dim {
+                    let mut c2 = child;
+                    std::thread::spawn(move || {
+                        let _ = c2.wait();
+                        let a = Adb::new(adb_path);
+                        a.set_screen_brightness(&s, orig);
+                        a.set_screen_brightness_mode(&s, mode);
+                    });
+                }
                 match self.adb() {
                     Some(adb) => match adb.start_app_for_user_on_display(
                         serial,
@@ -986,24 +1026,26 @@ impl GScrcpyApp {
             }
         } else if let Some(pkg) = app {
             // 机主应用
-            let args = scrcpy.build_args(serial, Some(pkg), &res, ww, wh, &title, profile.audio_enabled);
+            let args = scrcpy.build_args(serial, Some(pkg), &res, ww, wh, &title, profile.audio_enabled, profile.screen_off, profile.limit_fps);
             let virtual_display = args.iter().any(|a| a.contains("--new-display"));
             self.run_scrcpy(
                 &scrcpy,
                 &args,
                 virtual_display,
                 profile.gesture_fix != GestureFixMode::Off,
+                profile.dim_screen,
             );
             self.persist_usage(profile);
         } else {
             // 映射屏幕（无分身、无 app）
-            let args = scrcpy.build_args(serial, None, &res, ww, wh, &title, profile.audio_enabled);
+            let args = scrcpy.build_args(serial, None, &res, ww, wh, &title, profile.audio_enabled, profile.screen_off, profile.limit_fps);
             let virtual_display = args.iter().any(|a| a.contains("--new-display"));
             self.run_scrcpy(
                 &scrcpy,
                 &args,
                 virtual_display,
                 profile.gesture_fix != GestureFixMode::Off,
+                profile.dim_screen,
             );
             self.persist_usage(profile);
         }
@@ -1053,7 +1095,30 @@ impl GScrcpyApp {
         args: &[String],
         virtual_display: bool,
         repair_now: bool,
+        dim_screen: bool,
     ) {
+        // 投屏时调低亮度：启动前记录原亮度/模式并调低，投屏结束（scrcpy 退出）恢复
+        let dim = if dim_screen {
+            self.adb_path.clone().and_then(|adb_path| {
+                let adb = Adb::new(adb_path.clone());
+                self.selected_serial.clone().and_then(|s| {
+                    let orig = adb.screen_brightness(&s)?;
+                    let mode = adb.screen_brightness_mode(&s).unwrap_or(0);
+                    // 自动亮度开启时手动亮度无效：先关自动亮度再调低
+                    if mode != 0 {
+                        adb.set_screen_brightness_mode(&s, 0);
+                    }
+                    adb.set_screen_brightness(&s, 1);
+                    Some((adb_path, s, orig, mode))
+                })
+            })
+        } else {
+            None
+        };
+        // 记录残留状态：进程直接关闭时由 Drop 兜底恢复
+        self.dim_state = dim.clone();
+        // 记录残留状态：进程直接关闭时由 Drop 兜底恢复
+        self.dim_state = dim.clone();
         self.action_status = if virtual_display {
             "scrcpy 已启动（虚拟显示器模式，手机屏幕不受影响）。系统手势不可用（Android 平台限制）：鼠标右键=返回，Alt/Super+H=桌面，Alt/Super+S=最近任务".into()
         } else {
@@ -1061,7 +1126,7 @@ impl GScrcpyApp {
         };
         self.action_error = false;
         match scrcpy.launch(args) {
-            Ok(_child) => {
+            Ok(mut child) => {
                 // 虚拟显示器模式：投屏建立后立即物理化修复手势热区
                 // （用户验证方案：物理尺寸 VD 创建再移除 → 热区固化，手机手势恢复）
                 if virtual_display && repair_now {
@@ -1069,8 +1134,23 @@ impl GScrcpyApp {
                         self.repair_gesture_after_vd(&serial);
                     }
                 }
+                // 投屏结束（scrcpy 退出）恢复亮度与自动亮度模式
+                if let Some((adb_path, s, orig, mode)) = dim {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                        let a = Adb::new(adb_path);
+                        a.set_screen_brightness(&s, orig);
+                        a.set_screen_brightness_mode(&s, mode);
+                    });
+                }
             }
             Err(e) => {
+                // 启动失败：立即恢复亮度与自动亮度模式
+                if let Some((adb_path, s, orig, mode)) = dim {
+                    let a = Adb::new(adb_path);
+                    a.set_screen_brightness(&s, orig);
+                    a.set_screen_brightness_mode(&s, mode);
+                }
                 self.action_status = format!("启动失败: {e}");
                 self.action_error = true;
             }
@@ -1655,6 +1735,42 @@ impl GScrcpyApp {
         ui.heading("启动");
         ui.label(egui::RichText::new(format!("配置: {}", edit.name)).small().weak());
 
+        // ---------- 投屏选项：对「启动应用」与「映射屏幕」两种方式均生效 ----------
+        let mut edit_audio = edit.audio_enabled;
+        let mut screen_mode = if edit.screen_off {
+            1
+        } else if edit.dim_screen {
+            2
+        } else {
+            0
+        };
+        let mut edit_fps = edit.limit_fps;
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("投屏选项").strong());
+                ui.label(
+                    egui::RichText::new("对「启动应用」和「映射屏幕」两种方式均生效")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut edit_audio, "转接手机音频")
+                    .on_hover_text("把手机声音转发到电脑（默认不转接，声音留在手机）");
+                ui.checkbox(&mut edit_fps, "限制帧率 30fps")
+                    .on_hover_text("无线投屏带宽有限：限帧 30fps 减少传输压力，画面更稳定（适合无线调试）");
+                ui.separator();
+                ui.label("屏幕处理（投屏期间）:");
+                ui.radio_value(&mut screen_mode, 0, "保持手机屏幕");
+                ui.radio_value(&mut screen_mode, 1, "关闭手机屏幕")
+                    .on_hover_text("投屏期间手机黑屏，投屏结束自动恢复亮屏（部分设备会降低帧率）");
+                ui.radio_value(&mut screen_mode, 2, "调低手机亮度")
+                    .on_hover_text("投屏前调低亮度、投屏结束恢复，流畅度几乎无损");
+            });
+        ui.add_space(4.0);
+        ui.separator();
+
         // 两个启动按钮
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -1917,11 +2033,6 @@ impl GScrcpyApp {
             );
         });
 
-        // 音频转接开关：勾选 = 转接手机声音到电脑；不勾 = 不转接（声音留在手机）
-        let mut edit_audio = edit.audio_enabled;
-        ui.checkbox(&mut edit_audio, "转接手机音频");
-
-
         // 应用/标题/分辨率变更 → 写回编辑副本并保存（分身投屏固定为虚拟显示器模式，
         // 手势热区固定为 Auto，投屏结束后由后台线程自动物理化修复，均无需界面配置）
 
@@ -1945,6 +2056,17 @@ impl GScrcpyApp {
         }
         if edit_audio != edit.audio_enabled {
             edit.audio_enabled = edit_audio;
+            changed = true;
+        }
+        if edit_fps != edit.limit_fps {
+            edit.limit_fps = edit_fps;
+            changed = true;
+        }
+        let new_off = screen_mode == 1;
+        let new_dim = screen_mode == 2;
+        if new_off != edit.screen_off || new_dim != edit.dim_screen {
+            edit.screen_off = new_off;
+            edit.dim_screen = new_dim;
             changed = true;
         }
         if changed {
@@ -2018,6 +2140,13 @@ impl eframe::App for GScrcpyApp {
 impl Drop for GScrcpyApp {
     fn drop(&mut self) {
         self.stop_refresh.store(true, Ordering::Relaxed);
+        // 兜底恢复投屏时调低的亮度（幂等：已恢复则重复设置同值无副作用；
+        // 正常由 scrcpy 退出线程恢复，这里覆盖进程被直接关闭的情况）
+        if let Some((adb_path, serial, orig, mode)) = self.dim_state.take() {
+            let a = Adb::new(adb_path);
+            a.set_screen_brightness(&serial, orig);
+            a.set_screen_brightness_mode(&serial, mode);
+        }
         self.config.save();
     }
 }

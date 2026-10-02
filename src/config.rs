@@ -42,10 +42,22 @@ pub struct Profile {
     pub gesture_fix: GestureFixMode,
     /// 启动 app 时是否转接手机音频（scrcpy 3.x+ 默认把设备全部声音转发到电脑；
     /// false = 传 --no-audio）。设备级混音无法只转打开 app 的声音——
-    /// "转"就是转全部（含通知/其他 app），因此启动 app 场景默认不转接
-    /// （声音留在手机）；映射屏幕场景固定转接全部声音。
+    /// "转"就是转全部（含通知/其他 app），因此默认不转接（声音留在手机）。
     #[serde(default)]
     pub audio_enabled: bool,
+    /// 投屏时是否关闭手机屏幕（true = 传 --turn-screen-off：
+    /// 投屏期间手机黑屏，投屏结束自动恢复亮屏；部分设备关屏后会降低帧率）。
+    /// 与 dim_screen 互斥（UI 三选）。启动 app 与映射屏幕通用。
+    #[serde(default)]
+    pub screen_off: bool,
+    /// 投屏时是否调低手机亮度（true = 启动前 adb 调低、投屏结束恢复，
+    /// 流畅度几乎无损；与 screen_off 互斥）。
+    #[serde(default)]
+    pub dim_screen: bool,
+    /// 投屏时是否限制帧率 30fps（true = 传 --max-fps=30：无线投屏带宽有限，
+    /// 限帧减少传输压力，画面更稳定）。
+    #[serde(default)]
+    pub limit_fps: bool,
 }
 
 impl Default for Profile {
@@ -58,6 +70,9 @@ impl Default for Profile {
             resolution: String::new(),
             gesture_fix: GestureFixMode::Off,
             audio_enabled: false,
+            screen_off: false,
+            dim_screen: false,
+            limit_fps: false,
         }
     }
 }
