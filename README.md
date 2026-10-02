@@ -16,6 +16,8 @@
 - **配置持久化**：Profile（应用、分辨率、窗口尺寸、标题）、设备别名等自动保存（`%APPDATA%/gscrcpy/config.json`）
 - **刷新提速**：adb track-devices 事件驱动（500ms 去抖）+ 10 秒定时兜底
 - **单独更新 scrcpy**：从 GitHub Releases 检查/下载/安装最新版（scrcpy 压缩包自带 adb，一并管理）
+- **投屏选项（所有启动方式通用）**：转接手机音频开关、屏幕处理三选（保持屏幕 / 关闭屏幕 / 调低亮度，投屏结束自动恢复亮度与自动亮度模式）、限帧 30fps（无线投屏更稳定）
+- **渲染优化**：Direct3D 硬件渲染（`--render-driver=direct3d`），缓解无线投屏卡顿
 
 ## 启动参数模板
 
@@ -54,7 +56,7 @@ cargo build --release
 推送 `vx.x.x` 样式的 tag 即触发 GitHub Actions 自动构建并创建 Release（含 exe 与 zip 产物）：
 
 ```bash
-git tag v1.1.0
+git tag v1.2.0
 git push origin v1.1.0
 ```
 
